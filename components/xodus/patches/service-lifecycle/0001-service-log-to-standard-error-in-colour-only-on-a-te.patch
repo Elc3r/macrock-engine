@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 18:35:39 +0200
+Subject: [PATCH] service: log to standard error, in colour only on a terminal.
+
+The service's log went to standard output with ANSI colour codes even when a launcher stored it
+in a file, and every connection a client closed logged an error. It now goes to standard error,
+coloured only when that is a terminal, and a closed connection is a debug message.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: service-lifecycle
+---
+ crates/xodus-service/src/connection/router.rs |  6 +++++-
+ crates/xodus-service/src/main.rs              | 11 +++++++++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
+index 8deefbef90c3f91eb459a74a75583c32fe590da8..f3023b68fea8755e4899089244eef198ea730158 100644
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
+@@ -24,7 +24,11 @@ pub async fn route(
+         }
+         let read = socket.read_exact(&mut read_magic).await;
+         if let Err(err) = read {
+-            tracing::error!("Failed to read magic: {err:?}");
++            if err.kind() == std::io::ErrorKind::UnexpectedEof {
++                tracing::debug!("Connection closed");
++            } else {
++                tracing::error!("Failed to read magic: {err:?}");
++            }
+             return;
+         }
+ 
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 052734b1ac899b5a3ffa1bb12ef3cd27662fd3a9..fe67526a22b01303f766456e0e619df514398314 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -1,4 +1,5 @@
+ use std::fs::Permissions;
++use std::io::IsTerminal;
+ use std::os::unix::fs::PermissionsExt;
+ use std::sync::Arc;
+ 
+@@ -18,9 +19,15 @@ const PROTO_MAGIC: u32 = 0x58445350;
+ 
+ #[tokio::main]
+ async fn main() {
++    // Standard error keeps standard output free for a protocol; colours only for a terminal,
++    // since a launcher stores the log.
+     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
+-    let registry =
+-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
++    let registry = tracing_subscriber::registry().with(
++        tracing_subscriber::fmt::layer()
++            .with_writer(std::io::stderr)
++            .with_ansi(std::io::stderr().is_terminal())
++            .with_filter(filter),
++    );
+ 
+     #[cfg(feature = "tokio_console")]
+     {

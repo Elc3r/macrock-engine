@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:28:23 +0200
+Subject: [PATCH] service: leave the device's registration to signing in.
+
+The service registered the device with Microsoft when it started, so every new Keychain service
+added a device to the user's Microsoft account, even for an account that never signed in, and a
+service that could not reach Microsoft did not start (status 69). At start it now only renews the
+token of a registered device; signing in registers the device. Until then token requests get an
+empty answer and license requests a failure. A token that could not be renewed is logged instead
+of stopping the service.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: account
+---
+ crates/xodus-service/src/connection/xml.rs | 21 +++++++------
+ crates/xodus-service/src/main.rs           | 26 ++++++++---------
+ crates/xodus-service/src/simple_context.rs |  4 +--
+ crates/xodus/src/tokens/device.rs          | 34 +++++++++++++++++++---
+ 4 files changed, 57 insertions(+), 28 deletions(-)
+
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 5b09f40511590e8269fe77f2c412b21ba2f2d8b3..cdf73848ec2f092f4818c291586cacc0b4fa64fa 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -137,15 +137,18 @@ pub async fn parse_message(
+             let req = quick_xml::de::from_str::<GameLicenseRequest>(std::str::from_utf8(&buffer)?)?;
+             let market = req.market.unwrap_or_else(|| "US".to_owned());
+             // The license query reads the device's token from the store: renew it first.
+-            context.device_token().await?;
+-            let payload = match xodus::licensing::game::query_game_license(
+-                &context.client,
+-                context.tokens(),
+-                &req.store_id,
+-                &market,
+-            )
+-            .await
+-            {
++            let license = match context.device_token().await {
++                Ok(_) => xodus::licensing::game::query_game_license(
++                    &context.client,
++                    context.tokens(),
++                    &req.store_id,
++                    &market,
++                )
++                .await
++                .map_err(|err| err.to_string()),
++                Err(err) => Err(err.to_string()),
++            };
++            let payload = match license {
+                 Ok(license) => {
+                     tracing::info!(
+                         "Game license for {}: active {}, trial {}",
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index d8ee410d03f8d394502e3a8d8a81edc88d41c99f..584efc61574949c589252ffe8572e8e9a1adfef6 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -23,8 +23,6 @@ const PROTO_MAGIC: u32 = 0x58445350;
+ 
+ /// Exit statuses besides 0 (sysexits.h), for a launcher to explain.
+ mod status {
+-    /// Microsoft could not be reached, or did not register or authenticate the device.
+-    pub const UNAVAILABLE: u8 = 69;
+     /// The socket could not be created.
+     pub const CANT_CREATE: u8 = 73;
+     /// The keychain refused access to the credentials.
+@@ -147,21 +145,23 @@ async fn run() -> ExitCode {
+     ExitCode::SUCCESS
+ }
+ 
+-/// Opens the keychain and makes sure the device has credentials, registering it with Microsoft
+-/// the first time. A failure comes with the exit status that names it.
++/// Opens the keychain and renews the device's token if the device is registered: a refusal of
++/// the keychain shows at once, with the exit status that names it. Signing in registers the
++/// device; until then, and while Microsoft can't be reached, requests get no tokens.
+ async fn start() -> Result<Arc<TokenManager>, (u8, String)> {
+     xodus::secrets::init_secrets()
+         .map_err(|err| (status::NO_PERMISSION, format!("keychain: {err}")))?;
+     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
+-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens)
+-        .await
+-        .map_err(|err| {
+-            let status = match err {
+-                DeviceError::Keychain(_) => status::NO_PERMISSION,
+-                DeviceError::Microsoft(_) => status::UNAVAILABLE,
+-            };
+-            (status, err.to_string())
+-        })?;
++    match xodus::tokens::device::device_token(&reqwest::Client::new(), &tokens).await {
++        Ok(_) => {}
++        Err(DeviceError::NotRegistered) => tracing::info!("The device is not registered yet"),
++        Err(DeviceError::Microsoft(err)) => {
++            tracing::warn!("The device's token was not renewed: {err}")
++        }
++        Err(err @ DeviceError::Keychain(_)) => {
++            return Err((status::NO_PERMISSION, err.to_string()));
++        }
++    }
+     Ok(tokens)
+ }
+ 
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 78769c65bb198ee3c3aab164a41295844ea0a573..5a8f500b4c173337ee563cfc48487f004b25c8cb 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -32,9 +32,9 @@ impl SimpleContext {
+     }
+ 
+     /// The device's STS token, renewed first when it is about to expire: a service can run for
+-    /// longer than the token lasts.
++    /// longer than the token lasts. Requests never register the device; signing in does.
+     pub async fn device_token(&self) -> Result<LegacyToken, DeviceError> {
+         let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
+-        xodus::tokens::device::ensure_device_credentials(&self.client, &self.tokens).await
++        xodus::tokens::device::device_token(&self.client, &self.tokens).await
+     }
+ }
+diff --git a/crates/xodus/src/tokens/device.rs b/crates/xodus/src/tokens/device.rs
+index cf571b48099e627f38dcd4bb4a3211b8eb32f515..8095508f53636d9d5dbad417bacb84736c82ad4e 100644
+--- a/crates/xodus/src/tokens/device.rs
++++ b/crates/xodus/src/tokens/device.rs
+@@ -14,18 +14,36 @@ pub enum DeviceError {
+     Keychain(#[from] TokenStoreError),
+     #[error("Microsoft did not register or authenticate the device: {0}")]
+     Microsoft(String),
++    #[error("the device is not registered")]
++    NotRegistered,
+ }
+ 
+-/// Provisions a device if none is stored yet, re-authenticates it if its STS token is missing or
+-/// about to expire, persists the result through `tokens`, and returns the device's STS token.
++/// Registers the device with Microsoft if it has no license yet, then returns its STS token as
++/// `device_token` does.
+ pub async fn ensure_device_credentials(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
++) -> Result<LegacyToken, DeviceError> {
++    if matches!(
++        tokens.get_device_license(),
++        Err(TokenStoreError::NotFound | TokenStoreError::Serde(_))
++    ) {
++        provision_device(client, tokens).await?;
++    }
++    device_token(client, tokens).await
++}
++
++/// The device's STS token, re-authenticating the device when the token is missing or about to
++/// expire, persisted through `tokens`. A device that was never registered is an error: only
++/// `ensure_device_credentials` registers one.
++pub async fn device_token(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
+ ) -> Result<LegacyToken, DeviceError> {
+     let license = match tokens.get_device_license() {
+         Ok(license) => license,
+         Err(TokenStoreError::NotFound | TokenStoreError::Serde(_)) => {
+-            provision_device(client, tokens).await?
++            return Err(DeviceError::NotRegistered);
+         }
+         Err(err) => return Err(err.into()),
+     };
+@@ -114,9 +132,10 @@ async fn reauthenticate_device(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::expires_soon;
++    use super::{DeviceError, device_token, expires_soon};
+     use crate::models::secrets::LegacyToken;
+     use crate::models::soap::Timestamp;
++    use crate::tokens::TokenManager;
+ 
+     fn token(expires: chrono::DateTime<chrono::Utc>) -> LegacyToken {
+         LegacyToken {
+@@ -140,6 +159,13 @@ mod tests {
+         assert!(!expires_soon(&token(now + chrono::TimeDelta::minutes(6))));
+     }
+ 
++    #[tokio::test]
++    async fn gives_no_token_for_a_device_that_was_never_registered() {
++        let tokens = TokenManager::with_memory();
++        let result = device_token(&reqwest::Client::new(), &tokens).await;
++        assert!(matches!(result, Err(DeviceError::NotRegistered)));
++    }
++
+     #[test]
+     fn renews_a_token_whose_expiry_is_unreadable() {
+         let mut token = token(chrono::Utc::now() + chrono::TimeDelta::hours(1));

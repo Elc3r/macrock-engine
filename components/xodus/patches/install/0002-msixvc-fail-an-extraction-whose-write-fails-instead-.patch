@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 02:06:58 +0200
+Subject: [PATCH] msixvc: fail an extraction whose write fails, instead of
+ retrying it forever.
+
+Extracting a file retried a failed write every 30 seconds, printing the error to standard output
+and standard error, until it succeeded: with the disk full, an extraction never ended. The error
+now ends the extraction, for the caller to report.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: install
+---
+ crates/msixvc/src/xvd.rs | 6 +-----
+ 1 file changed, 1 insertion(+), 5 deletions(-)
+
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index b74a7ae759a1ec1092c6abecbc6c9cd2c146ef1b..6d5b2584bf39dd2359704ef0402040c2e0f7e911 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -998,11 +998,7 @@ impl XvdFile {
+             } else {
+                 to_write
+             };
+-            while let Err(err) = out.write_all(&page[..to_write]).await {
+-                eprintln!("Error write file {} waiting 30s", err);
+-                println!("Error write file {} waiting 30s", err);
+-                sleep(tokio::time::Duration::from_secs(30)).await;
+-            }
++            out.write_all(&page[..to_write]).await?;
+         }
+         Ok(())
+     }

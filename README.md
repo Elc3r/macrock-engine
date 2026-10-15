@@ -4,8 +4,8 @@ Run the Windows edition of Minecraft: Bedrock Edition on Apple Silicon Macs.
 
 macrock-engine is the runtime behind macrock, a macOS launcher in development. It combines
 [Wine](https://www.winehq.org) with a small set of patches, the Xbox GDK runtime that the game
-expects, and a service that keeps the player's Microsoft account. The game draws with
-Direct3D 12, which Apple's D3DMetal translates to Metal.
+expects, and a service that signs the player in with their Microsoft account and installs the
+game. The game draws with Direct3D 12, which Apple's D3DMetal translates to Metal.
 
 > [!NOTE]
 > **Looking to play?** macrock-engine is not an app. The macrock launcher will download it,
@@ -20,7 +20,7 @@ Direct3D 12, which Apple's D3DMetal translates to Metal.
 | --- | --- | --- |
 | Sign-in | Works | Xbox Live, as on Windows |
 | Online play | Works | servers, friends, parties, achievements |
-| Skins | Works | import from a file |
+| Skins | Works | import from a file; Release loses them at the next start ([Mojang's bug](docs/known-issues.md#imported-skins-disappear-at-the-next-start)) |
 | Marketplace | Works | offers with their prices |
 | Realms | Partial | the free trial loads; buying a plan fails |
 | Graphics | Works | Simple and Fancy need anti-aliasing off ([known issue](docs/known-issues.md#d3dmetal-40b2-metal-4-anti-aliasing-breaks-the-classic-renderer)) |
@@ -44,9 +44,9 @@ commit in `sources.json`, plus our patches in `components/<name>/`:
 
 | Component | Upstream | Our patches |
 | --- | --- | --- |
-| `wine` | [Wine](https://gitlab.winehq.org/wine/wine) 11.17 | the D3DMetal window bridge, faster synchronization (msync), AF_UNIX sockets, what the game's file picker needs |
+| `wine` | [Wine](https://gitlab.winehq.org/wine/wine) 11.17 | the D3DMetal window bridge, faster synchronization (msync), AF_UNIX sockets, what the game's file picker needs, a window title and a frame time log for launchers |
 | `xgameruntime` | [xodus-gaming/xgameruntime](https://github.com/xodus-gaming/xgameruntime), PR #18 | fixes to its connection to the service; XUser, XStore and the other GDK APIs the game uses |
-| `xodus` | [xodus-gaming/xodus](https://github.com/xodus-gaming/xodus) | socket path, Keychain namespace, game license requests |
+| `xodus` | [xodus-gaming/xodus](https://github.com/xodus-gaming/xodus) | socket path, Keychain namespace, game license requests; for launchers, a private channel to sign in and out and to install the game |
 
 ## Requirements
 
@@ -85,7 +85,7 @@ docs/             the documents below
 - [Working on the patches](docs/patches.md): editing a series with `tools/engine`, moving to a
   new upstream version.
 - [The runtime for launchers](docs/runtime.md): release files, the bundle, prefix setup,
-  environment variables.
+  environment variables, the account service.
 - [What Minecraft asks of the runtime](docs/minecraft-gdk-contract.md): the GDK and Windows APIs
   the game uses, and how each one is answered.
 - [Known issues](docs/known-issues.md).
@@ -104,5 +104,6 @@ docs/             the documents below
 ## License
 
 Each patch is under the license of the component it changes: LGPL-2.1-or-later for Wine and
-xgameruntime, GPL-3.0-only for Xodus. The tools, scripts and tests are GPL-3.0-or-later.
+xgameruntime, GPL-3.0-only for Xodus. The tools, scripts and tests are GPL-3.0-or-later
+([COPYING](COPYING)).
 [LICENSE.md](LICENSE.md) has the details, and a release carries the licenses of everything in it.

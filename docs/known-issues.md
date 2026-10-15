@@ -44,6 +44,22 @@ platform store" without a further Store call. The Store's public add-on list doe
 current Realms subscriptions, and the runtime cannot tell what the user owns (entitled product
 queries return nothing): no Store service answers ownership for the user's own tokens.
 
+## Imported skins disappear at the next start
+
+On Release 26.42 to 26.52 the game deletes an imported skin about 10 seconds after its next start,
+before it signs in, and the player is Steve again. This is Mojang's bug MCPE-241720, which Windows
+and iOS have too; Preview 26.60.30 keeps the skin. Imported skins never sync between devices
+either: Bedrock keeps each one on the device that imported it.
+
+## Script debugger: the game does not accept connections in listen mode
+
+`/script debugger connect localhost 19144`, the flow Mojang's VS Code extension documents, works
+with nothing to set up. `/script debugger listen <port>` does not: the game binds the port,
+listens, `select`s in another thread, then closes the socket without calling `accept` and starts
+again every 3 to 5 seconds, resetting any connection. A Windows program that makes the same
+calls on this runtime gets `select` and `accept` right, so the cause is in what the game's own
+`select` sees; not found yet.
+
 ## Sign-in prompt at the first start of a profile
 
 On a new profile the game shows its sign-in prompt at start; "Maybe later" continues signed in.

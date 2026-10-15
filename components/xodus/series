@@ -4,3 +4,17 @@
 socket-path/0001-service-take-the-socket-path-from-XODUS_SOCKET.patch
 credential-namespace/0001-secrets-choose-the-keychain-service-with-XODUS_KEYCH.patch
 game-license/0001-service-answer-game-license-requests.patch
+service-lifecycle/0001-service-log-to-standard-error-in-colour-only-on-a-te.patch
+service-lifecycle/0002-device-renew-an-expiring-token-and-return-errors-ins.patch
+service-lifecycle/0003-service-stop-on-SIGTERM-as-on-SIGINT-and-exit-with-a.patch
+service-lifecycle/0004-service-renew-the-device-s-token-during-a-session-an.patch
+launcher-channel/0001-service-serve-only-the-launcher-on-a-channel-it-pass.patch
+account/0001-service-leave-the-device-s-registration-to-signing-i.patch
+account/0002-service-sign-in-on-the-launcher-channel.patch
+account/0003-service-sign-out-and-tell-the-account-s-status-and-g.patch
+account/0004-tokens-keep-an-account-s-credentials-in-one-keychain.patch
+install/0001-service-find-the-game-s-package-for-the-launcher.patch
+install/0002-msixvc-fail-an-extraction-whose-write-fails-instead-.patch
+install/0003-licensing-get-the-key-of-a-package-s-content-without.patch
+install/0004-service-install-the-game-for-the-launcher.patch
+install/0005-msixvc-extract-a-Preview-package-s-executable-which-.patch

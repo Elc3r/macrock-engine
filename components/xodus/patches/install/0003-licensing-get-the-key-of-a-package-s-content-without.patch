@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 02:06:58 +0200
+Subject: [PATCH] licensing: get the key of a package's content, without
+ panicking.
+
+content_key gets the key that decrypts a package's content. The licensing service gives the
+content's license for the signed-in user, with the same MSA tokens as a game license, and the
+license holds the key wrapped with the device's key. A user who does not own the content gets
+NotEntitled. get_license_content no longer panics on an answer without a readable license.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: install
+---
+ crates/xodus/src/licensing.rs         |  1 +
+ crates/xodus/src/licensing/content.rs | 12 +++--
+ crates/xodus/src/licensing/game.rs    |  3 +-
+ crates/xodus/src/licensing/key.rs     | 63 +++++++++++++++++++++++++++
+ 4 files changed, 75 insertions(+), 4 deletions(-)
+ create mode 100644 crates/xodus/src/licensing/key.rs
+
+diff --git a/crates/xodus/src/licensing.rs b/crates/xodus/src/licensing.rs
+index 91c297aecf0ab0181d7687f3906135cd81110714..bdf76b9dd81446528dbcadc95a13ca3bd49eaaa6 100644
+--- a/crates/xodus/src/licensing.rs
++++ b/crates/xodus/src/licensing.rs
+@@ -1,4 +1,5 @@
+ pub mod content;
+ pub mod game;
++pub mod key;
+ pub mod splicense;
+ pub mod utils;
+diff --git a/crates/xodus/src/licensing/content.rs b/crates/xodus/src/licensing/content.rs
+index 2755f1b39bfdac9dfdf8f689dc2fa3ac01c656ca..d929127f29f02819e5262157718e4315d344b11c 100644
+--- a/crates/xodus/src/licensing/content.rs
++++ b/crates/xodus/src/licensing/content.rs
+@@ -20,6 +20,10 @@ pub enum LicenseContentError {
+     /// not covered by the account's current subscription tier).
+     #[error("not entitled to this content: {description}")]
+     NotEntitled { description: String },
++
++    /// The answer does not hold a license the client can read.
++    #[error("unreadable license: {0}")]
++    Unreadable(String),
+ }
+ 
+ // we might need a bump in xal-rs concerning reqwest,
+@@ -71,9 +75,11 @@ pub async fn get_license_content(
+             });
+         }
+     };
+-    let license = &content.keys[0].value;
+-    let license = BASE64_STANDARD.decode(license).unwrap();
+-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
++    let unreadable = |err: &dyn std::fmt::Display| LicenseContentError::Unreadable(err.to_string());
++    let license = &content.keys.first().ok_or_else(|| unreadable(&"no key"))?.value;
++    let license = BASE64_STANDARD.decode(license).map_err(|err| unreadable(&err))?;
++    let license = String::from_utf8(license).map_err(|err| unreadable(&err))?;
++    let license = quick_xml::de::from_str::<License>(&license).map_err(|err| unreadable(&err))?;
+     Ok((content, license))
+ }
+ 
+diff --git a/crates/xodus/src/licensing/game.rs b/crates/xodus/src/licensing/game.rs
+index 7e72bb029d666bbe5793c8ef5510feff236677ed..f5e4ad0491a12f733e4a0326f9a26ce6380f2c4a 100644
+--- a/crates/xodus/src/licensing/game.rs
++++ b/crates/xodus/src/licensing/game.rs
+@@ -79,11 +79,12 @@ pub async fn query_game_license(
+             Ok(GameLicense::default())
+         }
+         Err(LicenseContentError::Request(error)) => Err(error.into()),
++        Err(LicenseContentError::Unreadable(reason)) => Err(GameLicenseError::Catalog(reason)),
+     }
+ }
+ 
+ /// The device's and the user's MSA tokens for the licensing service, and the user's PUID.
+-async fn licensing_tokens(
++pub(crate) async fn licensing_tokens(
+     client: &reqwest::Client,
+     tokens: &TokenManager,
+ ) -> Result<(String, String, String), GameLicenseError> {
+diff --git a/crates/xodus/src/licensing/key.rs b/crates/xodus/src/licensing/key.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ec01fac2ac0edb556b13782dc95323ee7135926
+--- /dev/null
++++ b/crates/xodus/src/licensing/key.rs
+@@ -0,0 +1,63 @@
++//! The key that decrypts a package's content, from the content's license for the signed-in
++//! user. The license wraps the key with the device's key, which the device license holds.
++
++use crate::licensing::content::{LicenseContentError, get_license_content};
++use crate::licensing::game::{GameLicenseError, licensing_tokens};
++use crate::licensing::splicense::{ContentKey, SPLicense};
++use crate::tokens::TokenManager;
++
++#[derive(Debug, thiserror::Error)]
++pub enum ContentKeyError {
++    #[error("tokens: {0}")]
++    Tokens(String),
++    /// The user does not own the content.
++    #[error("not entitled to this content: {0}")]
++    NotEntitled(String),
++    #[error("request error: {0}")]
++    Request(#[from] reqwest::Error),
++    #[error("unreadable license: {0}")]
++    Unreadable(String),
++}
++
++/// The key of the content `content_id`, a package's content ID, licensed to the signed-in user.
++pub async fn content_key(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    content_id: String,
++    market: String,
++) -> Result<ContentKey, ContentKeyError> {
++    let (device_token, user_token, puid) =
++        licensing_tokens(client, tokens)
++            .await
++            .map_err(|err| match err {
++                GameLicenseError::Request(err) => ContentKeyError::Request(err),
++                err => ContentKeyError::Tokens(err.to_string()),
++            })?;
++    let (_content, license) =
++        get_license_content(client, device_token, user_token, puid, content_id, market)
++            .await
++            .map_err(|err| match err {
++                LicenseContentError::NotEntitled { description } => {
++                    ContentKeyError::NotEntitled(description)
++                }
++                LicenseContentError::Request(err) => ContentKeyError::Request(err),
++                LicenseContentError::Unreadable(reason) => ContentKeyError::Unreadable(reason),
++            })?;
++    let unreadable = |what: &str| ContentKeyError::Unreadable(what.to_owned());
++    let content =
++        SPLicense::parse_base64(&license.splicense_block).map_err(|_| unreadable("the license"))?;
++    let device = tokens
++        .get_device_license()
++        .map_err(|_| unreadable("no device license"))?;
++    let device_key = SPLicense::parse_base64(&device.splicense)
++        .map_err(|_| unreadable("the device license"))?
++        .encrypted_device_key
++        .ok_or_else(|| unreadable("no device key"))?
++        .derive_device_key();
++    let mut keys = content.content_keys.into_values();
++    let (Some(key), None) = (keys.next(), keys.next()) else {
++        return Err(unreadable("not one key"));
++    };
++    key.unpack(&device_key)
++        .map_err(|_| unreadable("a key the device's key does not open"))
++}

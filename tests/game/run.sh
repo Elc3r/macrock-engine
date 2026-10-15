@@ -3,21 +3,21 @@
 #
 #   GAME              the game folder (Minecraft.Windows.exe, MicrosoftGame.Config)
 #   GPTK_LIB          the lib directory of an imported Game Porting Toolkit (D3DMetal)
-#   GAMEINPUT_SCRIPT  an installer of GameInput from the game's redistributable, run as
-#                     SCRIPT --prefix P --msi M --wineserver W, then --check; it leaves the
-#                     registry file P/.standalone-gameinput.reg to import
 #   XODUS_SOCKET      a running xodus-service with a signed-in account
-#   PREFIX            the Wine prefix, default $ENGINE_WORK/prefix-game, prepared the first time
+#   PREFIX            the Wine prefix, default $ENGINE_WORK/prefix-game; a prefix that macrock
+#                     prepared is used as it is, any other is prepared the first time
+#   GAMEINPUT_SCRIPT  to prepare a prefix: an installer of GameInput from the game's
+#                     redistributable, run as SCRIPT --prefix P --msi M --wineserver W, then
+#                     --check; it leaves the registry file P/.standalone-gameinput.reg to import
 #   D3DM_MTL4=0       D3DMetal's Metal 3 backend instead of Metal 4
 #   MACROCK_FPS_LOG   a file that receives one line of frame times per second
 #   GAME_ENV          NAME=value words added to the game's environment
 #   LOG_FILTER        an extended grep expression: the log keeps only the lines that match
-#   LOG_PIPE          a command that filters the output instead; it must pass "exit status" lines
 #
-# A new prefix gets the game folder as the runtime's game drive (setup.json's game_drive) and
-# GameInput; before every launch prefix-setup.py applies what the runtime declares a prefix needs,
-# as the launcher will. The output goes to $ENGINE_WORK/game/minecraft-<time>.log: the runtime
-# logs no tokens, but raw Wine traces (WINEDEBUG) can. Returns when the game exits.
+# A prepared prefix has GameInput. Before every launch the game folder becomes the runtime's game
+# drive (setup.json's game_drive) and prefix-setup.py applies what the runtime declares a prefix
+# needs, as the launcher does. The output goes to $ENGINE_WORK/game/minecraft-<time>.log: the
+# runtime logs no tokens, but raw Wine traces (WINEDEBUG) can. Returns when the game exits.
 set -eu
 TESTS=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$TESTS/../lib.sh"
@@ -46,10 +46,10 @@ run_game() {
     ${GAME_ENV:-} "$RUNTIME/bin/wine" "$@"
 }
 
-if [ ! -f "$PREFIX/.macrock-game" ]; then
+# macrock's prefixes carry the state file of prefix-setup.py but not this script's marker.
+if [ ! -f "$PREFIX/.macrock-game" ] && [ ! -f "$PREFIX/.macrock-engine.json" ]; then
   [ -n "${GAMEINPUT_SCRIPT:-}" ] && [ -f "$GAMEINPUT_SCRIPT" ] || die "set GAMEINPUT_SCRIPT to a GameInput installer"
   ensure_prefix
-  ln -sfn "$GAME" "$PREFIX/dosdevices/$DRIVE"
   setup="$LOGS/prefix-gameinput.log"
   info "Installing GameInput into $PREFIX (log: $setup)"
   msi="$GAME/Installers/GameInputRedist.msi"
@@ -59,11 +59,11 @@ if [ ! -f "$PREFIX/.macrock-game" ]; then
   /usr/bin/python3 "$GAMEINPUT_SCRIPT" --prefix "$PREFIX" --msi "$msi" --check >> "$setup" 2>&1
   touch "$PREFIX/.macrock-game"
 fi
+ln -sfn "$GAME" "$PREFIX/dosdevices/$DRIVE"
 $PYTHON "$TESTS/prefix-setup.py" "$RUNTIME" "$PREFIX"
 
 log_filter() {
-  if [ -n "${LOG_PIPE:-}" ]; then sh -c "$LOG_PIPE"
-  elif [ -n "${LOG_FILTER:-}" ]; then grep -a --line-buffered -E "$LOG_FILTER|^exit status"
+  if [ -n "${LOG_FILTER:-}" ]; then grep -a --line-buffered -E "$LOG_FILTER|^exit status"
   else cat
   fi
 }

@@ -2,18 +2,19 @@
 # run.sh [RUNTIME]: check the Xodus service end to end.
 #
 #   1. start xodus-service (XODUS_SERVICE, default the build's libexec/xodus-service: release
-#      bundles do not carry it) on a private socket (XODUS_SOCKET), with its
+#      bundles do not carry it; it must be signed ad hoc, since a signed service serves only the
+#      launcher, through its channel) on a private socket (XODUS_SOCKET), with its
 #      credentials in a test Keychain service (XODUS_KEYCHAIN_SERVICE, default
-#      "macrock-engine test"), never a real account's; the first run registers a device with
-#      Microsoft, as Xodus does, and needs the network;
+#      "macrock-engine test"), never a real account's; the service registers no device (signing
+#      in does), so it adds nothing to that Keychain service and needs no network;
 #   2. speak its protocol from the host: a PING comes back as PONG with the same payload, a token
-#      request without a signed-in user gets an empty answer, a game license request a failure
-#      (the catalog lookup needs the network), and the connection still works;
-#   3. run part of xgameruntime's tests under Wine against it, among them XUserAddAsync, which
-#      must find no default user, and check from the service log that the runtime connected
+#      request without a signed-in user gets an empty answer, a game license request a failure,
+#      and the connection still works;
+#   3. run xgameruntime's XUserNoAccountTests under Wine against it (XUserAddAsync must find no
+#      default user), and check from the service log that the runtime connected
 #      (xgameruntime -> Wine AF_UNIX -> the real service).
-# The service log is $ENGINE_WORK/build-xodus/test-service.log (service debug messages only; they
-# carry no tokens). Exit 0 when everything passed.
+# The service log is $ENGINE_WORK/build-xodus/test-service.log, at debug level: it has the raw
+# bytes of each request, and this test's requests carry no secrets. Exit 0 when everything passed.
 set -eu
 TESTS=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$TESTS/../lib.sh"
@@ -84,7 +85,7 @@ print("ping after the failed request: still answered")
 EOF
 
 before=$(grep -c 'Connection from pid' "$LOG" || true)
-XODUS_SOCKET="$SOCKET" XGR_XODUS_NO_ACCOUNT=1 GTEST_FILTER='XNetworkingTests.*:XSystemTests.*:XUserNoAccountTests.*' \
+XODUS_SOCKET="$SOCKET" XGR_XODUS_NO_ACCOUNT=1 GTEST_FILTER='XUserNoAccountTests.*' \
   "$TESTS/../xgameruntime/run.sh" "$RUNTIME"
 after=$(grep -c 'Connection from pid' "$LOG" || true)
 info "service: $((after - before)) connection(s) from the runtime under Wine"

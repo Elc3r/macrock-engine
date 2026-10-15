@@ -2,8 +2,9 @@
 # run.sh [RUNTIME]: check that the runtime's WinHTTP rejects bad server certificates.
 #
 # See winhttp-tls-probe.c: HTTPS requests to badssl.com (needs the network); the valid host must
-# be accepted, the expired, wrong-host, self-signed and untrusted-root ones rejected. The probe is
-# built with llvm-mingw into $ENGINE_WORK/probes; the Wine prefix is $ENGINE_WORK/prefix-probe.
+# be accepted, the expired, wrong-host, self-signed and untrusted-root ones rejected for their
+# certificate. The probe is built with llvm-mingw into $ENGINE_WORK/probes; the Wine prefix is
+# $ENGINE_WORK/prefix-probe.
 set -eu
 TESTS=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$TESTS/../lib.sh"

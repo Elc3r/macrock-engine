@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 18:46:59 +0200
+Subject: [PATCH] service: renew the device's token during a session, and
+ answer a refused user token.
+
+The service read the device's STS token once, at start, and handed it to every connection: a
+game that ran past its expiry got failures from then on. Each token request and license query now
+asks for the token, renewed when it is about to expire, one request at a time. When Microsoft
+refuses to exchange the user's token without interaction, the request gets an empty answer and
+the log a warning that the account may need signing in again, instead of a panic.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: service-lifecycle
+---
+ crates/xodus-service/src/connection/router.rs |  4 +--
+ crates/xodus-service/src/connection/xml.rs    | 13 +++++++--
+ crates/xodus-service/src/main.rs              | 29 +++++++++----------
+ crates/xodus-service/src/simple_context.rs    | 22 +++++++++-----
+ 4 files changed, 39 insertions(+), 29 deletions(-)
+
+diff --git a/crates/xodus-service/src/connection/router.rs b/crates/xodus-service/src/connection/router.rs
+index f3023b68fea8755e4899089244eef198ea730158..c8afb1179203dec9d98de22e076073403c25c779 100644
+--- a/crates/xodus-service/src/connection/router.rs
++++ b/crates/xodus-service/src/connection/router.rs
+@@ -2,7 +2,6 @@ use std::sync::Arc;
+ 
+ use tokio::io::AsyncReadExt;
+ use tokio_util::sync::CancellationToken;
+-use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ 
+ use crate::simple_context::SimpleContext;
+@@ -10,13 +9,12 @@ use crate::simple_context::SimpleContext;
+ pub async fn route(
+     mut socket: tokio::net::UnixStream,
+     token: CancellationToken,
+-    device_token: LegacyToken,
+     tokens: Arc<TokenManager>,
+ ) {
+     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
+     tracing::debug!("Connection from pid {cred:?}");
+ 
+-    let mut context = SimpleContext::new(device_token, tokens);
++    let mut context = SimpleContext::new(tokens);
+     loop {
+         let mut read_magic = [0; 4];
+         if token.is_cancelled() {
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 63798552e3bf70396cf6fd47debb0f86f340259d..5b09f40511590e8269fe77f2c412b21ba2f2d8b3 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -54,7 +54,7 @@ pub async fn parse_message(
+             } else {
+                 "xboxlive.signin"
+             };
+-            let device_token = context.device_token.as_ref().unwrap();
++            let device_token = context.device_token().await?;
+             let device_token_resp = xodus::api::live::exchange_device_token(
+                 &context.client,
+                 device_token.clone(),
+@@ -78,7 +78,7 @@ pub async fn parse_message(
+                 &context.client,
+                 token,
+                 "USERNAME".to_string(),
+-                device_token.clone(),
++                device_token,
+                 None,
+                 Some("Silent".to_string()),
+                 req.client_id.clone(),
+@@ -125,12 +125,19 @@ pub async fn parse_message(
+                     let payload = quick_xml::se::to_string(&payload)?;
+                     Ok(payload.as_bytes().to_vec())
+                 }
+-                _ => todo!("Error handling sill sucks"),
++                _ => {
++                    tracing::warn!(
++                        "Microsoft refused the user's token without interaction: the account may need signing in again"
++                    );
++                    Ok(vec![])
++                }
+             }
+         }
+         XodusMessageType::GameLicenseRequest => {
+             let req = quick_xml::de::from_str::<GameLicenseRequest>(std::str::from_utf8(&buffer)?)?;
+             let market = req.market.unwrap_or_else(|| "US".to_owned());
++            // The license query reads the device's token from the store: renew it first.
++            context.device_token().await?;
+             let payload = match xodus::licensing::game::query_game_license(
+                 &context.client,
+                 context.tokens(),
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 6a6b1fb244110b4c4c8a5b5e10b0225f72ded904..abd136ca2af9df4b6762d4619bc8a09b2a0dc005 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
+ use tracing_subscriber::Layer;
+ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
+-use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
+ 
+@@ -79,7 +78,7 @@ async fn run() -> ExitCode {
+         },
+         () = stop.received() => return ExitCode::SUCCESS,
+     };
+-    let (tokens, device_token) = match started {
++    let tokens = match started {
+         Ok(started) => started,
+         Err((status, message)) => {
+             tracing::error!("{message}");
+@@ -112,10 +111,9 @@ async fn run() -> ExitCode {
+             accepted = listener.accept() => match accepted {
+                 Ok((socket, _)) => {
+                     let token = cancellation.clone();
+-                    let device_token = device_token.clone();
+                     let tokens = tokens.clone();
+                     tokio::spawn(async move {
+-                        connection::router::route(socket, token, device_token, tokens).await
++                        connection::router::route(socket, token, tokens).await
+                     });
+                 }
+                 Err(err) => tracing::warn!("Failed to accept a connection: {err}"),
+@@ -130,21 +128,20 @@ async fn run() -> ExitCode {
+ 
+ /// Opens the keychain and makes sure the device has credentials, registering it with Microsoft
+ /// the first time. A failure comes with the exit status that names it.
+-async fn start() -> Result<(Arc<TokenManager>, LegacyToken), (u8, String)> {
++async fn start() -> Result<Arc<TokenManager>, (u8, String)> {
+     xodus::secrets::init_secrets()
+         .map_err(|err| (status::NO_PERMISSION, format!("keychain: {err}")))?;
+     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
+-    let device_token =
+-        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens)
+-            .await
+-            .map_err(|err| {
+-                let status = match err {
+-                    DeviceError::Keychain(_) => status::NO_PERMISSION,
+-                    DeviceError::Microsoft(_) => status::UNAVAILABLE,
+-                };
+-                (status, err.to_string())
+-            })?;
+-    Ok((tokens, device_token))
++    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens)
++        .await
++        .map_err(|err| {
++            let status = match err {
++                DeviceError::Keychain(_) => status::NO_PERMISSION,
++                DeviceError::Microsoft(_) => status::UNAVAILABLE,
++            };
++            (status, err.to_string())
++        })?;
++    Ok(tokens)
+ }
+ 
+ /// SIGINT and SIGTERM, whichever comes first. Their handlers are installed on creation.
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 2900465b4223131c0697b65247b9372671d2b4b2..78769c65bb198ee3c3aab164a41295844ea0a573 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -2,31 +2,39 @@
+ 
+ use std::sync::Arc;
+ 
++use tokio::sync::Mutex;
+ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
++use xodus::tokens::device::DeviceError;
++
++/// Held while the device's token is checked and renewed, so that requests arriving together
++/// renew it once.
++static DEVICE_TOKEN_RENEWAL: Mutex<()> = Mutex::const_new(());
+ 
+ pub struct SimpleContext {
+     pub client: reqwest::Client,
+-    pub device_token: Option<LegacyToken>,
+     tokens: Arc<TokenManager>,
+ }
+ 
+ impl SimpleContext {
+-    pub fn new(device_token: LegacyToken, tokens: Arc<TokenManager>) -> Self {
++    pub fn new(tokens: Arc<TokenManager>) -> Self {
+         let client = reqwest::ClientBuilder::new()
+             .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
+             .connection_verbose(true)
+             .build()
+             .unwrap();
+ 
+-        Self {
+-            client,
+-            device_token: Some(device_token),
+-            tokens,
+-        }
++        Self { client, tokens }
+     }
+ 
+     pub fn tokens(&self) -> &Arc<TokenManager> {
+         &self.tokens
+     }
++
++    /// The device's STS token, renewed first when it is about to expire: a service can run for
++    /// longer than the token lasts.
++    pub async fn device_token(&self) -> Result<LegacyToken, DeviceError> {
++        let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
++        xodus::tokens::device::ensure_device_credentials(&self.client, &self.tokens).await
++    }
+ }

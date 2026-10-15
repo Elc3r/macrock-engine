@@ -3,10 +3,11 @@
 #
 # PACKAGES (default $ENGINE_WORK/packages) holds index.json and the archives package.sh wrote.
 # Each archive must have the size and SHA-256 the index gives. The bundle is extracted into a
-# temporary directory and must pass codesign's strict verification and match its manifest file
-# by file (no file missing, changed or extra); its Wine must start. The Xodus service archive
-# must hold an arm64 binary with a valid signature and its licenses. With --probe, the D3D12
-# window probe (tests/window-probe) runs on the extracted runtime too. Exit 0 when all pass.
+# temporary directory and must pass codesign's strict verification, have the code directory hash
+# the index gives, and match its manifest file by file (no file missing, changed or extra); its
+# Wine must start. The Xodus service archive must hold an arm64 binary with a valid signature, its
+# licenses and the .proto files of its launcher channel. With --probe, the D3D12 window probe
+# (tests/window-probe) runs on the extracted runtime too. Exit 0 when all pass.
 set -eu
 TESTS=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$TESTS/../lib.sh"
@@ -30,6 +31,7 @@ check() {
 }
 same() { [ "$1" = "$2" ]; }
 
+check "index schema 2" same "$(json_get "$INDEX" schema)" 2
 for part in bundle helper; do
   file="$PACKAGES/$(json_get "$INDEX" "$part.file")"
   check "$part archive size" same "$(stat -f %z "$file")" "$(json_get "$INDEX" "$part.size")"
@@ -43,16 +45,19 @@ aa extract -i "$PACKAGES/$(json_get "$INDEX" bundle.file)" -d "$T"
 bundle="$T/$(json_get "$INDEX" bundle.path)"
 runtime="$bundle/Contents/Resources/runtime"
 check "bundle seal (codesign --verify --strict)" codesign --verify --strict "$bundle"
+check "bundle code directory hash matches the index" same \
+  "$(codesign -dvvv "$bundle" 2>&1 | sed -n 's/^CDHash=//p')" "$(json_get "$INDEX" bundle.cdhash)"
 check "bundle files match the manifest" $PYTHON "$HERE/manifest.py" verify "$bundle/Contents/Resources"
 check "manifest is clean" same "$(json_get "$bundle/Contents/Resources/manifest.json" dirty)" false
 check "wine starts ($("$runtime/bin/wine" --version 2>/dev/null || echo no version))" "$runtime/bin/wine" --version
-check "prefix setup present" test -f "$runtime/share/macrock-engine/prefix/setup.json"
 
 aa extract -i "$PACKAGES/$(json_get "$INDEX" helper.file)" -d "$T"
 helper="$T/$(json_get "$INDEX" helper.path)"
 check "xodus-service is arm64" same "$(lipo -archs "$helper" 2>/dev/null)" arm64
 check "xodus-service signature" codesign --verify --strict "$helper"
 check "xodus-service licenses" test -s "$(dirname "$helper")/THIRD-PARTY-LICENSES.md" -a -s "$(dirname "$helper")/LICENSE"
+check "xodus-service channel messages" test -s "$(dirname "$helper")/proto/common.proto" \
+  -a -s "$(dirname "$helper")/proto/launcher.proto"
 
 if [ -n "$PROBE" ]; then
   check "D3D12 window probe on the extracted runtime" "$TESTS/../window-probe/run.sh" "$PROBE" "$runtime"

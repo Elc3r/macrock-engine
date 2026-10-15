@@ -14,19 +14,19 @@ Original work for macrock (GPL-3.0-only, as Xodus).
 
 Topic: game-license
 ---
- crates/xodus-service/src/connection/xml.rs    |  31 ++++
+ crates/xodus-service/src/connection/xml.rs    |  36 +++++
  crates/xodus/proto/xodus/common.proto         |   3 +
  crates/xodus/src/licensing.rs                 |   1 +
  crates/xodus/src/licensing/game.rs            | 138 ++++++++++++++++++
  crates/xodus/src/models/displaycatalog.rs     |   6 +
  crates/xodus/src/models/xgameruntime/mod.rs   |   1 +
  .../xodus/src/models/xgameruntime/xstore.rs   |  24 +++
- 7 files changed, 204 insertions(+)
+ 7 files changed, 209 insertions(+)
  create mode 100644 crates/xodus/src/licensing/game.rs
  create mode 100644 crates/xodus/src/models/xgameruntime/xstore.rs
 
 diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
-index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..ee112d5274939f991cc432f8bd180923801c0a7e 100644
+index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..63798552e3bf70396cf6fd47debb0f86f340259d 100644
 --- a/crates/xodus-service/src/connection/xml.rs
 +++ b/crates/xodus-service/src/connection/xml.rs
 @@ -2,6 +2,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,7 +37,7 @@ index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..ee112d5274939f991cc432f8bd180923
  use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
  use xodus::proto::xodus::XodusMessageType;
  
-@@ -127,6 +128,36 @@ pub async fn parse_message(
+@@ -127,6 +128,41 @@ pub async fn parse_message(
                  _ => todo!("Error handling sill sucks"),
              }
          }
@@ -55,7 +55,9 @@ index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..ee112d5274939f991cc432f8bd180923
 +                Ok(license) => {
 +                    tracing::info!(
 +                        "Game license for {}: active {}, trial {}",
-+                        req.store_id, license.is_active, license.is_trial
++                        req.store_id,
++                        license.is_active,
++                        license.is_trial
 +                    );
 +                    GameLicenseResponse {
 +                        is_active: license.is_active,
@@ -66,7 +68,10 @@ index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..ee112d5274939f991cc432f8bd180923
 +                }
 +                Err(err) => {
 +                    tracing::warn!("Game license for {} unknown: {err}", req.store_id);
-+                    GameLicenseResponse { result: 0x80004005, ..Default::default() } // E_FAIL
++                    GameLicenseResponse {
++                        result: 0x80004005,
++                        ..Default::default()
++                    } // E_FAIL
 +                }
 +            };
 +            Ok(quick_xml::se::to_string(&payload)?.into_bytes())

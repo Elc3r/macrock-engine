@@ -1,0 +1,741 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:45:34 +0200
+Subject: [PATCH] service: sign out, and tell the account's status and
+ gamertag.
+
+LAUNCHER_SIGN_OUT forgets the user and, with device set, the device's registration too, as
+removing an account does. What is already gone counts as removed: the keychain backend no longer
+fails on a missing item. LAUNCHER_ACCOUNT_STATUS reads from the keychain alone whether the device
+is registered and a user is signed in. It also tells whether Microsoft refused the user's token
+for the last request that needed it, in which case the user must sign in again. LAUNCHER_PROFILE
+gets an Xbox token for http://xboxlive.com and answers with its gamertag and no other identifier.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: account
+---
+ crates/xodus-service/src/account.rs         | 332 +++++++++++++++++---
+ crates/xodus-service/src/connection/xml.rs  |   2 +
+ crates/xodus-service/src/launcher.rs        |  17 +-
+ crates/xodus-service/src/simple_context.rs  |   9 +
+ crates/xodus/proto/xodus/common.proto       |   6 +
+ crates/xodus/proto/xodus/launcher.proto     |  55 ++++
+ crates/xodus/src/licensing/game.rs          |   7 +-
+ crates/xodus/src/models/xbox.rs             |   8 +
+ crates/xodus/src/tokens/backend/keychain.rs |   5 +-
+ crates/xodus/src/tokens/manager.rs          |  24 ++
+ 10 files changed, 424 insertions(+), 41 deletions(-)
+
+diff --git a/crates/xodus-service/src/account.rs b/crates/xodus-service/src/account.rs
+index acd9cb14b5346af09ac05579a6f42eb1b34f953f..ecadb7197e8572adcef9b0866c6823552aa8c0e8 100644
+--- a/crates/xodus-service/src/account.rs
++++ b/crates/xodus-service/src/account.rs
+@@ -1,13 +1,19 @@
+ //! The account's operations the launcher asks for on its channel.
+ 
++use xodus::api::xbox::{authenticate_xbox_user, request_xsts_token};
+ use xodus::models::live::{DAProperty, ExchangeUserTokenOutcome};
+ use xodus::models::secrets::{LegacyToken, Token, User};
+ use xodus::models::soap;
++use xodus::proto::xodus::account_status::State;
+ use xodus::proto::xodus::failure::Reason;
+-use xodus::proto::xodus::sign_in_result::Outcome;
+-use xodus::proto::xodus::{Failure, SignIn, SignInResult, SignedIn};
++use xodus::proto::xodus::{
++    AccountStatus, AccountStatusResult, Failure, Profile, ProfileResult, SignIn, SignInResult,
++    SignOut, SignOutResult, SignedIn, SignedOut, account_status_result, profile_result,
++    sign_in_result, sign_out_result,
++};
+ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
++use xodus::tokens::store::TokenStoreError;
+ 
+ use crate::simple_context::SimpleContext;
+ 
+@@ -16,27 +22,79 @@ const CLIENT_ID: &str = "000000004424da1f";
+ const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
+ const TOKEN_BROKER_SCOPE: &str = "http://Passport.NET/tb";
+ 
++// The application and scope of xodus's Xbox token (api::xbox::run), and the relying party whose
++// token carries the gamertag.
++const XBOX_APP_ID: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
++const XBOX_USER_SCOPE: &str = "user.auth.xboxlive.com";
++const XBOX_LIVE: &str = "http://xboxlive.com";
++
+ /// Exchanges what the sign-in page posted for the account's tokens and keeps them with the user,
+ /// registering the device first if it is not registered yet.
+ pub async fn sign_in(context: &SimpleContext, request: SignIn) -> SignInResult {
+     let outcome = exchange(context, request)
+         .await
+-        .unwrap_or_else(Outcome::Failure);
++        .unwrap_or_else(sign_in_result::Outcome::Failure);
+     SignInResult {
+         outcome: Some(outcome),
+     }
+ }
+ 
+-async fn exchange(context: &SimpleContext, request: SignIn) -> Result<Outcome, Failure> {
++/// Forgets the user, and the device's registration too when asked.
++pub async fn sign_out(context: &SimpleContext, request: SignOut) -> SignOutResult {
++    let forgotten = if request.device {
++        context.forget_account().await
++    } else {
++        context.tokens().remove_user()
++    };
++    context.tokens().note_user_token_refused(false);
++    let outcome = match forgotten {
++        Ok(()) => {
++            tracing::info!("Signed out");
++            sign_out_result::Outcome::SignedOut(SignedOut {})
++        }
++        Err(err) => {
++            tracing::error!("The account's credentials were not removed: {err}");
++            sign_out_result::Outcome::Failure(failure(Reason::Keychain))
++        }
++    };
++    SignOutResult {
++        outcome: Some(outcome),
++    }
++}
++
++/// What the service holds for the account, read from the keychain alone.
++pub fn account_status(context: &SimpleContext) -> AccountStatusResult {
++    let tokens = context.tokens();
++    let outcome = match state(tokens) {
++        Ok(state) => account_status_result::Outcome::Status(AccountStatus {
++            state: state.into(),
++            sign_in_again: tokens.user_token_refused(),
++        }),
++        Err(failure) => account_status_result::Outcome::Failure(failure),
++    };
++    AccountStatusResult {
++        outcome: Some(outcome),
++    }
++}
++
++/// The signed-in user's gamertag, from an Xbox token: the name the launcher shows.
++pub async fn profile(context: &SimpleContext) -> ProfileResult {
++    let outcome = match gamertag(context).await {
++        Ok(gamertag) => profile_result::Outcome::Profile(Profile { gamertag }),
++        Err(failure) => profile_result::Outcome::Failure(failure),
++    };
++    ProfileResult {
++        outcome: Some(outcome),
++    }
++}
++
++async fn exchange(
++    context: &SimpleContext,
++    request: SignIn,
++) -> Result<sign_in_result::Outcome, Failure> {
+     let page = serde_json::from_str::<DAProperty>(&request.server_data)
+         .map_err(|_| failure(Reason::InvalidServerData))?;
+-    let device = context.register_device().await.map_err(|err| {
+-        tracing::warn!("The device could not sign in: {err}");
+-        failure(match err {
+-            DeviceError::Keychain(_) => Reason::Keychain,
+-            DeviceError::Microsoft(_) | DeviceError::NotRegistered => Reason::Unavailable,
+-        })
+-    })?;
++    let device = context.register_device().await.map_err(device_failure)?;
+     let mut scopes = vec![(
+         USER_AUTH_SCOPE.to_string(),
+         Some(soap::PolicyReference::token_broker()),
+@@ -82,7 +140,7 @@ fn conclude(
+     tokens: &TokenManager,
+     user: &User,
+     exchanged: ExchangeUserTokenOutcome,
+-) -> Result<Outcome, Failure> {
++) -> Result<sign_in_result::Outcome, Failure> {
+     use soap::BodyContent::{RequestSecurityTokenResponse, RequestSecurityTokenResponseCollection};
+ 
+     match exchanged {
+@@ -91,18 +149,12 @@ fn conclude(
+             ..
+         })) => {
+             tracing::info!("Microsoft asked for another sign-in page");
+-            Ok(Outcome::InlineAuthUrl(url))
++            Ok(sign_in_result::Outcome::InlineAuthUrl(url))
+         }
+         ExchangeUserTokenOutcome::Fault(pp) => {
+-            let status = pp
+-                .and_then(|pp| pp.req_status)
+-                .and_then(|status| hresult(&status))
+-                .unwrap_or_default();
+-            tracing::warn!("Microsoft refused the sign-in: {status:#010x}");
+-            Err(Failure {
+-                reason: Reason::Refused.into(),
+-                status,
+-            })
++            let refusal = refusal(pp);
++            tracing::warn!("Microsoft refused the sign-in: {:#010x}", refusal.status);
++            Err(refusal)
+         }
+         ExchangeUserTokenOutcome::Issued(RequestSecurityTokenResponseCollection(collection)) => {
+             keep(tokens, user, collection.security_tokens)
+@@ -122,7 +174,7 @@ fn keep(
+     tokens: &TokenManager,
+     user: &User,
+     issued: Vec<soap::RequestSecurityTokenResponse>,
+-) -> Result<Outcome, Failure> {
++) -> Result<sign_in_result::Outcome, Failure> {
+     issued
+         .into_iter()
+         .try_for_each(|response| {
+@@ -143,8 +195,115 @@ fn keep(
+             tracing::error!("The sign-in's tokens were not kept: {err}");
+             failure(Reason::Keychain)
+         })?;
++    tokens.note_user_token_refused(false);
+     tracing::info!("Signed in");
+-    Ok(Outcome::SignedIn(SignedIn {}))
++    Ok(sign_in_result::Outcome::SignedIn(SignedIn {}))
++}
++
++fn state(tokens: &TokenManager) -> Result<State, Failure> {
++    if stored(tokens.get_device_license())?.is_none() {
++        return Ok(State::Empty);
++    }
++    let signed_in =
++        stored(tokens.get_user())?.is_some() && stored(tokens.get_user_sts_token())?.is_some();
++    Ok(if signed_in {
++        State::SignedIn
++    } else {
++        State::DeviceOnly
++    })
++}
++
++async fn gamertag(context: &SimpleContext) -> Result<String, Failure> {
++    use soap::BodyContent::{RequestSecurityTokenResponse, RequestSecurityTokenResponseCollection};
++
++    let tokens = context.tokens();
++    let (Some(user), Some(Token::Legacy(user_sts))) = (
++        stored(tokens.get_user())?,
++        stored(tokens.get_user_sts_token())?,
++    ) else {
++        return Err(failure(Reason::NotSignedIn));
++    };
++    let device = context.device_token().await.map_err(device_failure)?;
++    let unavailable = |err: &dyn std::fmt::Display| {
++        tracing::warn!("No Xbox profile: {err}");
++        failure(Reason::Unavailable)
++    };
++    let exchanged = xodus::api::live::exchange_user_token(
++        &context.client,
++        user_sts,
++        user.username,
++        device,
++        None,
++        Some("Silent".to_string()),
++        XBOX_APP_ID.to_string(),
++        &[(
++            XBOX_USER_SCOPE.to_string(),
++            Some(soap::PolicyReference::mbi_ssl()),
++        )],
++    )
++    .await
++    .map_err(|err| unavailable(&err))?;
++    let response = match exchanged {
++        ExchangeUserTokenOutcome::Issued(RequestSecurityTokenResponseCollection(
++            mut collection,
++        )) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0),
++        ExchangeUserTokenOutcome::Issued(RequestSecurityTokenResponse(response)) => *response,
++        ExchangeUserTokenOutcome::Issued(_) => return Err(unavailable(&"no user token")),
++        ExchangeUserTokenOutcome::Fault(pp) => {
++            tokens.note_user_token_refused(true);
++            let refusal = refusal(pp);
++            tracing::warn!(
++                "Microsoft refused the user's token: {:#010x}",
++                refusal.status
++            );
++            return Err(refusal);
++        }
++    };
++    tokens.note_user_token_refused(false);
++    let Token::Compact(ticket) = Token::from(response) else {
++        return Err(unavailable(&"not a compact user token"));
++    };
++    let user_token = authenticate_xbox_user(&context.client, ticket)
++        .await
++        .map_err(|err| unavailable(&err))?;
++    let xsts = request_xsts_token(&context.client, user_token.token, XBOX_LIVE)
++        .await
++        .map_err(|err| unavailable(&err))?;
++    xsts.gamertag()
++        .map(str::to_string)
++        .ok_or_else(|| unavailable(&"no gamertag in the Xbox token"))
++}
++
++/// A keychain read: a missing or unreadable item is None, a refusal a failure.
++fn stored<T>(read: Result<T, TokenStoreError>) -> Result<Option<T>, Failure> {
++    match read {
++        Ok(value) => Ok(Some(value)),
++        Err(TokenStoreError::NotFound | TokenStoreError::Serde(_)) => Ok(None),
++        Err(err) => {
++            tracing::error!("{err}");
++            Err(failure(Reason::Keychain))
++        }
++    }
++}
++
++fn device_failure(err: DeviceError) -> Failure {
++    tracing::warn!("The device has no token: {err}");
++    failure(match err {
++        DeviceError::Keychain(_) => Reason::Keychain,
++        DeviceError::Microsoft(_) => Reason::Unavailable,
++        DeviceError::NotRegistered => Reason::NotSignedIn,
++    })
++}
++
++fn refusal(pp: Option<soap::PP>) -> Failure {
++    let status = pp
++        .and_then(|pp| pp.req_status)
++        .and_then(|status| hresult(&status))
++        .unwrap_or_default();
++    Failure {
++        reason: Reason::Refused.into(),
++        status,
++    }
+ }
+ 
+ fn failure(reason: Reason) -> Failure {
+@@ -163,8 +322,15 @@ fn hresult(status: &str) -> Option<u32> {
+ mod tests {
+     use std::sync::Arc;
+ 
++    use xodus::models::secrets::Device;
++    use xodus::tokens::PASSPORT_STS;
++
+     use super::*;
+ 
++    fn context() -> SimpleContext {
++        SimpleContext::new(Arc::new(TokenManager::with_memory()))
++    }
++
+     fn user() -> User {
+         User {
+             puid: "0001000000000001".to_string(),
+@@ -172,6 +338,40 @@ mod tests {
+         }
+     }
+ 
++    fn sign_in_fully(tokens: &TokenManager) {
++        let device = Device {
++            puid: "0002000000000002".to_string(),
++            hwid: "hwid".to_string(),
++            device_id: "device".to_string(),
++            splicense: "license".to_string(),
++            username: "02device".to_string(),
++            password: "password".to_string(),
++        };
++        let user_sts = LegacyToken {
++            key_name: Some(PASSPORT_STS.to_string()),
++            token: "<EncryptedData/>".to_string(),
++            binary_secret: None,
++            tpm_key: None,
++            lifetime: soap::Timestamp {
++                id: None,
++                created: "2026-10-10T00:00:00Z".to_string(),
++                expires: "2026-10-11T00:00:00Z".to_string(),
++            },
++        };
++        tokens.save_device_license(&device).unwrap();
++        tokens
++            .save_user_token(PASSPORT_STS.to_string(), Token::Legacy(user_sts))
++            .unwrap();
++        tokens.save_user(&user()).unwrap();
++    }
++
++    fn status(context: &SimpleContext) -> AccountStatus {
++        match account_status(context).outcome {
++            Some(account_status_result::Outcome::Status(status)) => status,
++            outcome => panic!("no status: {outcome:?}"),
++        }
++    }
++
+     fn fault(inline_auth_url: Option<&str>, req_status: Option<&str>) -> ExchangeUserTokenOutcome {
+         ExchangeUserTokenOutcome::Fault(Some(soap::PP {
+             xmlns_psf: None,
+@@ -209,16 +409,25 @@ mod tests {
+         }
+     }
+ 
++    fn issued(tokens: Vec<soap::RequestSecurityTokenResponse>) -> ExchangeUserTokenOutcome {
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(
++            soap::RequestSecurityTokenResponseCollection {
++                security_tokens: tokens,
++            },
++        ))
++    }
++
+     #[tokio::test]
+     async fn refuses_data_that_no_sign_in_page_posted() {
+-        let context = SimpleContext::new(Arc::new(TokenManager::with_memory()));
+         let request = SignIn {
+             server_data: r#"{"sDAToken": "t=token"}"#.to_string(),
+             inline_auth: false,
+         };
+         assert_eq!(
+-            sign_in(&context, request).await.outcome,
+-            Some(Outcome::Failure(failure(Reason::InvalidServerData)))
++            sign_in(&context(), request).await.outcome,
++            Some(sign_in_result::Outcome::Failure(failure(
++                Reason::InvalidServerData
++            )))
+         );
+     }
+ 
+@@ -227,7 +436,10 @@ mod tests {
+         let tokens = TokenManager::with_memory();
+         let url = "https://login.live.com/inline";
+         let outcome = conclude(&tokens, &user(), fault(Some(url), None));
+-        assert_eq!(outcome, Ok(Outcome::InlineAuthUrl(url.to_string())));
++        assert_eq!(
++            outcome,
++            Ok(sign_in_result::Outcome::InlineAuthUrl(url.to_string()))
++        );
+         assert!(tokens.get_user().is_err());
+     }
+ 
+@@ -248,18 +460,13 @@ mod tests {
+     #[test]
+     fn keeps_the_issued_tokens_and_the_user() {
+         let tokens = TokenManager::with_memory();
+-        let issued = soap::RequestSecurityTokenResponseCollection {
+-            security_tokens: vec![
+-                compact_token("user.auth.xboxlive.com", "t=user"),
+-                compact_token("http://Passport.NET/tb", "t=broker"),
+-            ],
+-        };
+-        let exchanged = ExchangeUserTokenOutcome::Issued(
+-            soap::BodyContent::RequestSecurityTokenResponseCollection(issued),
+-        );
++        let exchanged = issued(vec![
++            compact_token("user.auth.xboxlive.com", "t=user"),
++            compact_token("http://Passport.NET/tb", "t=broker"),
++        ]);
+         assert_eq!(
+             conclude(&tokens, &user(), exchanged),
+-            Ok(Outcome::SignedIn(SignedIn {}))
++            Ok(sign_in_result::Outcome::SignedIn(SignedIn {}))
+         );
+         assert!(matches!(
+             tokens.get_user_token_for("user.auth.xboxlive.com"),
+@@ -274,4 +481,53 @@ mod tests {
+             Some("player@example.com".to_string())
+         );
+     }
++
++    #[test]
++    fn tells_an_empty_account_a_registered_device_and_a_signed_in_user() {
++        let context = context();
++        assert_eq!(status(&context).state(), State::Empty);
++        sign_in_fully(context.tokens());
++        assert_eq!(status(&context).state(), State::SignedIn);
++        context.tokens().remove_user().unwrap();
++        assert_eq!(status(&context).state(), State::DeviceOnly);
++    }
++
++    #[test]
++    fn asks_to_sign_in_again_until_a_sign_in_succeeds() {
++        let context = context();
++        sign_in_fully(context.tokens());
++        context.tokens().note_user_token_refused(true);
++        assert!(status(&context).sign_in_again);
++        let exchanged = issued(vec![compact_token("user.auth.xboxlive.com", "t=user")]);
++        conclude(context.tokens(), &user(), exchanged).unwrap();
++        assert!(!status(&context).sign_in_again);
++    }
++
++    #[tokio::test]
++    async fn signs_out_the_user_and_forgets_the_device_only_when_asked() {
++        let context = context();
++        sign_in_fully(context.tokens());
++        context.tokens().note_user_token_refused(true);
++
++        let result = sign_out(&context, SignOut { device: false }).await;
++        assert_eq!(
++            result.outcome,
++            Some(sign_out_result::Outcome::SignedOut(SignedOut {}))
++        );
++        assert_eq!(status(&context).state(), State::DeviceOnly);
++        assert!(!status(&context).sign_in_again);
++
++        sign_out(&context, SignOut { device: true }).await;
++        assert_eq!(status(&context).state(), State::Empty);
++    }
++
++    #[tokio::test]
++    async fn has_no_profile_without_a_signed_in_user() {
++        assert_eq!(
++            profile(&context()).await.outcome,
++            Some(profile_result::Outcome::Failure(failure(
++                Reason::NotSignedIn
++            )))
++        );
++    }
+ }
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index cdf73848ec2f092f4818c291586cacc0b4fa64fa..570a9da14ebbec4f8523789177bb39ce3241f508 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -96,6 +96,7 @@ pub async fn parse_message(
+                 ExchangeUserTokenOutcome::Issued(
+                     soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+                 ) => {
++                    context.tokens().note_user_token_refused(false);
+                     if let Some(sts) = collection.security_tokens.pop() {
+                         let address = sts.applies_to.endpoint_reference.address.clone();
+                         let sts: Token = sts.into();
+@@ -126,6 +127,7 @@ pub async fn parse_message(
+                     Ok(payload.as_bytes().to_vec())
+                 }
+                 _ => {
++                    context.tokens().note_user_token_refused(true);
+                     tracing::warn!(
+                         "Microsoft refused the user's token without interaction: the account may need signing in again"
+                     );
+diff --git a/crates/xodus-service/src/launcher.rs b/crates/xodus-service/src/launcher.rs
+index a32612cd7aa56487c26257cb28f7a86d59068d5f..f1e329517fe46d903bf97ddb692260722e0a2ec0 100644
+--- a/crates/xodus-service/src/launcher.rs
++++ b/crates/xodus-service/src/launcher.rs
+@@ -7,7 +7,7 @@ use std::os::fd::FromRawFd;
+ use prost::Message;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::UnixStream;
+-use xodus::proto::xodus::{Hello, SignIn, XodusMessageType};
++use xodus::proto::xodus::{Hello, SignIn, SignOut, XodusMessageType};
+ 
+ use crate::PROTO_MAGIC;
+ use crate::simple_context::SimpleContext;
+@@ -78,6 +78,21 @@ pub async fn serve(mut channel: UnixStream, context: SimpleContext) {
+                     Vec::new()
+                 }
+             },
++            Ok(XodusMessageType::LauncherSignOut) => match SignOut::decode(payload.as_slice()) {
++                Ok(request) => crate::account::sign_out(&context, request)
++                    .await
++                    .encode_to_vec(),
++                Err(err) => {
++                    tracing::error!("Unreadable SIGN_OUT on the launcher channel: {err}");
++                    Vec::new()
++                }
++            },
++            Ok(XodusMessageType::LauncherAccountStatus) => {
++                crate::account::account_status(&context).encode_to_vec()
++            }
++            Ok(XodusMessageType::LauncherProfile) => {
++                crate::account::profile(&context).await.encode_to_vec()
++            }
+             _ => Vec::new(),
+         };
+         let frame = crate::connection::encode_message(PROTO_MAGIC, message_type + 1, reply);
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 893989b9531c05a2470e69d659e541f7f46f31f5..3ab90d5f63d14ff584d5790f07cd810ed8513a4a 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
+ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
++use xodus::tokens::store::TokenStoreError;
+ 
+ /// Held while the device is registered, or its token checked and renewed, so that requests
+ /// arriving together register or renew it once.
+@@ -44,4 +45,12 @@ impl SimpleContext {
+         let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
+         xodus::tokens::device::ensure_device_credentials(&self.client, &self.tokens).await
+     }
++
++    /// Forgets the user and the device's registration, holding the renewal lock so that no
++    /// renewal writes the device's token back.
++    pub async fn forget_account(&self) -> Result<(), TokenStoreError> {
++        let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
++        self.tokens.remove_persistent()?;
++        self.tokens.remove_device_license()
++    }
+ }
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index 6621186b82bc41226c2da8ff2d66e52135551f25..074a09d4b471b173c3cbc3fd298c6f024e605976 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -16,4 +16,10 @@ enum XodusMessageType {
+     LAUNCHER_HELLO_RESPONSE=201;
+     LAUNCHER_SIGN_IN=202;
+     LAUNCHER_SIGN_IN_RESPONSE=203;
++    LAUNCHER_SIGN_OUT=204;
++    LAUNCHER_SIGN_OUT_RESPONSE=205;
++    LAUNCHER_ACCOUNT_STATUS=206;
++    LAUNCHER_ACCOUNT_STATUS_RESPONSE=207;
++    LAUNCHER_PROFILE=208;
++    LAUNCHER_PROFILE_RESPONSE=209;
+ }
+diff --git a/crates/xodus/proto/xodus/launcher.proto b/crates/xodus/proto/xodus/launcher.proto
+index 734e143444129b40230e1f061ebcc9392bf74faa..d7265e6d6db7d476ee3d015d2ae9491da61b2b96 100644
+--- a/crates/xodus/proto/xodus/launcher.proto
++++ b/crates/xodus/proto/xodus/launcher.proto
+@@ -32,6 +32,59 @@ message SignInResult {
+ 
+ message SignedIn {}
+ 
++// LAUNCHER_SIGN_OUT: forgets the user, and the device's registration too when asked. What is
++// already gone counts as forgotten.
++message SignOut {
++    // Also forget the device's registration, as when the account is removed from the launcher.
++    bool device = 1;
++}
++
++// The response to LAUNCHER_SIGN_OUT.
++message SignOutResult {
++    oneof outcome {
++        SignedOut signed_out = 1;
++        Failure failure = 2;
++    }
++}
++
++message SignedOut {}
++
++// The response to LAUNCHER_ACCOUNT_STATUS, whose request is empty: what the service holds for the
++// account, read from the keychain alone.
++message AccountStatusResult {
++    oneof outcome {
++        AccountStatus status = 1;
++        Failure failure = 2;
++    }
++}
++
++message AccountStatus {
++    enum State {
++        STATE_UNSPECIFIED = 0;
++        // The device is not registered.
++        STATE_EMPTY = 1;
++        // The device is registered, and no user is signed in.
++        STATE_DEVICE_ONLY = 2;
++        STATE_SIGNED_IN = 3;
++    }
++    State state = 1;
++    // Microsoft refused the user's token for the last request that needed it, since the service
++    // started: the user must sign in again.
++    bool sign_in_again = 2;
++}
++
++// The response to LAUNCHER_PROFILE, whose request is empty: the signed-in user's Xbox profile.
++message ProfileResult {
++    oneof outcome {
++        Profile profile = 1;
++        Failure failure = 2;
++    }
++}
++
++message Profile {
++    string gamertag = 1;
++}
++
+ // Why a request of the launcher failed.
+ message Failure {
+     enum Reason {
+@@ -44,6 +97,8 @@ message Failure {
+         REASON_REFUSED = 3;
+         // The keychain refused access to the credentials.
+         REASON_KEYCHAIN = 4;
++        // No user is signed in.
++        REASON_NOT_SIGNED_IN = 5;
+     }
+     Reason reason = 1;
+     // For REASON_REFUSED, Microsoft's status (an HRESULT such as 0x80048821) when it gave one.
+diff --git a/crates/xodus/src/licensing/game.rs b/crates/xodus/src/licensing/game.rs
+index aec01623b54650e2dd0f6b26e32cf03112e620b3..7e72bb029d666bbe5793c8ef5510feff236677ed 100644
+--- a/crates/xodus/src/licensing/game.rs
++++ b/crates/xodus/src/licensing/game.rs
+@@ -129,8 +129,13 @@ async fn licensing_tokens(
+             collection.security_tokens.remove(0).into()
+         }
+         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(token)) => (*token).into(),
+-        _ => return Err(failed("user token exchange refused")),
++        ExchangeUserTokenOutcome::Fault(_) => {
++            tokens.note_user_token_refused(true);
++            return Err(failed("user token exchange refused"));
++        }
++        ExchangeUserTokenOutcome::Issued(_) => return Err(failed("no user token in the answer")),
+     };
++    tokens.note_user_token_refused(false);
+     let Token::Compact(user_token) = user_token else {
+         return Err(failed("unexpected user token"));
+     };
+diff --git a/crates/xodus/src/models/xbox.rs b/crates/xodus/src/models/xbox.rs
+index b7cd9898895b8dcad89087f90978578a07d2957e..631215367d04a2e0f04026b0be1b1b4218ab9c32 100644
+--- a/crates/xodus/src/models/xbox.rs
++++ b/crates/xodus/src/models/xbox.rs
+@@ -55,6 +55,14 @@ impl XstsResponse {
+             .first()
+             .map(|claim| claim.uhs.as_str())
+     }
++
++    /// The user's gamertag, which a token for http://xboxlive.com carries.
++    pub fn gamertag(&self) -> Option<&str> {
++        self.display_claims
++            .xui
++            .first()
++            .and_then(|claim| claim.gtg.as_deref())
++    }
+ }
+ 
+ #[derive(Debug, Serialize)]
+diff --git a/crates/xodus/src/tokens/backend/keychain.rs b/crates/xodus/src/tokens/backend/keychain.rs
+index 6aa6cde8355c834e54cb369ffe760e45614f0dfe..906cd583facac3dc9d76918f2a602c75547ce858 100644
+--- a/crates/xodus/src/tokens/backend/keychain.rs
++++ b/crates/xodus/src/tokens/backend/keychain.rs
+@@ -17,6 +17,9 @@ impl TokenBackend for KeychainBackend {
+     }
+ 
+     fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
+-        Ok(crate::secrets::get_entry(key)?.delete_credential()?)
++        match crate::secrets::get_entry(key)?.delete_credential() {
++            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
++            Err(e) => Err(e.into()),
++        }
+     }
+ }
+diff --git a/crates/xodus/src/tokens/manager.rs b/crates/xodus/src/tokens/manager.rs
+index aeb98973acdf9f42c5b37b4e27de304f8bc02600..da33ae6d14ada0a817e266c92c08a1e94f5b4462 100644
+--- a/crates/xodus/src/tokens/manager.rs
++++ b/crates/xodus/src/tokens/manager.rs
+@@ -12,6 +12,7 @@ mod keys {
+     pub const DEVICE_TOKENS: &str = "device-tokens";
+     pub const USER_TOKENS: &str = "user-tokens";
+     pub const USER_INFO: &str = "user-DA";
++    pub const USER_TOKEN_REFUSED: &str = "user-token-refused";
+ }
+ 
+ pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
+@@ -125,6 +126,29 @@ impl TokenManager {
+             .set(keys::USER_INFO, &serde_json::to_vec(user)?)
+     }
+ 
++    /// Forgets the user and the user's tokens, keeping the device.
++    pub fn remove_user(&self) -> Result<(), TokenStoreError> {
++        self.persistent.remove(keys::USER_INFO)?;
++        self.persistent.remove(keys::USER_TOKENS)
++    }
++
++    // ---- Whether Microsoft refused the user's token ----------------------------
++
++    /// Notes whether Microsoft refused the user's token for a request that cannot ask the user,
++    /// or issued it. A refusal holds, for this process, until a token is issued.
++    pub fn note_user_token_refused(&self, refused: bool) {
++        let _ = if refused {
++            self.ephemeral.set(keys::USER_TOKEN_REFUSED, &[])
++        } else {
++            self.ephemeral.remove(keys::USER_TOKEN_REFUSED)
++        };
++    }
++
++    /// Whether Microsoft last refused the user's token: the user must sign in again.
++    pub fn user_token_refused(&self) -> bool {
++        matches!(self.ephemeral.get(keys::USER_TOKEN_REFUSED), Ok(Some(_)))
++    }
++
+     // ---- Ephemeral XSTS-by-relying-party cache --------------------------------
+ 
+     pub fn get_cached_xsts(&self, relying_party: &str) -> Option<XstsResponse> {

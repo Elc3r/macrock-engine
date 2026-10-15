@@ -23,3 +23,8 @@ HOMEBREW_FORMULAE="bison gnutls freetype pkgconf gettext ccache cmake protobuf r
 # version whose D3DMetal the runtime is built for (the user imports it).
 REPO=vincenzopio/macrock-engine
 GPTK_REQUIRED=4
+
+# The version of the IPC between xgameruntime and xodus-service. A launcher keeps the service in
+# its app bundle and downloads the runtime, so it pairs a runtime only with a service of the
+# same protocol: bump it with any change to the messages either side sends or expects.
+SERVICE_PROTOCOL=1

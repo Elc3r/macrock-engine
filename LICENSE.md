@@ -28,5 +28,5 @@ they come from.
 
 ## Tools and scripts
 
-`tools/`, `packaging/` and `tests/` are licensed GPL-3.0-or-later, like macrock. See
-<https://www.gnu.org/licenses/gpl-3.0.html>.
+`tools/`, `packaging/` and `tests/` are licensed GPL-3.0-or-later, like macrock. The license text
+is in `COPYING` in the repository and at <https://www.gnu.org/licenses/gpl-3.0.html>.

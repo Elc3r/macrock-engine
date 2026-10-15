@@ -26,7 +26,8 @@ The steps are:
 3. **GnuTLS and FreeType**, copied next to Wine from the Gcenx archive.
 4. **xgameruntime**, with CMake, llvm-mingw and Wine's IDL compiler.
 5. **xodus-service**, with cargo, for arm64. It keeps the Microsoft account's credentials in the
-   Keychain.
+   Keychain. `xodus-cli`, a development tool kept out of the runtime, goes to `build.noindex/bin`:
+   its `login` signs an account in for the tests.
 
 The result can be moved: Wine finds its files relative to its own location.
 
@@ -45,8 +46,10 @@ tree is left alone and the build is incremental.
 | `RECONFIGURE` | unset | run Wine's `configure` again |
 | `REBUILD_TOOLS` | unset | build the arm64 tools again |
 
-With a fixed `SIGNING_IDENTITY`, the Keychain's "Always Allow" survives rebuilds of
-xodus-service.
+A service signed with a real `SIGNING_IDENTITY` serves only a launcher signed with the same
+certificate, through the launcher channel ([runtime.md](runtime.md#the-launcher-channel)). Started
+any other way, it exits with status 78, so the tests need the ad hoc default. The Keychain trusts
+each build of the service on its own: a new build asks for the password again, once per item.
 
 ## Releases
 
@@ -76,13 +79,28 @@ script's header explains its options.
 | `tests/tls/run.sh` | WinHTTP rejects bad server certificates | network |
 | `tests/window-probe/run.sh <gptk>/lib` | a D3D12 swapchain fills its window: windowed, resized, fullscreen | GPTK, Screen Recording permission |
 | `tests/xgameruntime/run.sh` | xgameruntime's unit tests and its connection to the service | |
-| `tests/xodus/run.sh` | xodus-service's protocol, and xgameruntime talking to it | network, the built xodus-service |
-| `tests/xuser-live/run.sh` | sign-in and Xbox Live tokens with a real account | `XODUS_SOCKET`, `GAME_CONFIG` |
+| `tests/xodus/run.sh` | xodus-service's protocol, and xgameruntime talking to it | the built xodus-service, signed ad hoc |
+| `tests/xuser-live/run.sh` | sign-in, Xbox Live tokens and the game license with a real account | network, `XODUS_SOCKET` with an account signed in by `xodus-cli login`, `GAME_CONFIG` |
 | `tests/bundle/check.sh` | a release: checksums, seal, manifest, Wine, the service | |
-| `tests/game/run.sh` | plays the game | `GAME`, `GPTK_LIB`, `GAMEINPUT_SCRIPT`, `XODUS_SOCKET` |
-| `tests/http-capture/run.sh` | the game's HTTP requests, without tokens or queries | as `tests/game` |
+| `tests/game/run.sh` | plays the game | `GAME`, `GPTK_LIB`, `XODUS_SOCKET`, a prefix macrock prepared or `GAMEINPUT_SCRIPT` |
 
 The runtime's own logs never contain tokens. Raw Wine traces (`WINEDEBUG`) can, so do not share
 them.
 
+`tests/game/run.sh` can play in a prefix of the macrock launcher, which already has GameInput:
+macrock keeps one per account in `~/Library/Application Support/macrock/prefixes`. Quit macrock
+first. Any other prefix needs `GAMEINPUT_SCRIPT`, an installer of GameInput from the game's own
+redistributable.
+
 The tests of `tools/engine` run with `/usr/bin/python3 -m unittest discover -s tools/tests`.
+
+The Rust tests of xodus-service and xodus run in the tree that `build-xodus.sh` generates, with the
+toolchain `bootstrap.sh` installs:
+
+```sh
+cd build.noindex/src/xodus
+cargo +1.98.0 test --locked -p xodus-service -p xodus -- \
+  --skip test_minecraft_win_auth --skip test_get_xbox_live_dev_token
+```
+
+The two skipped tests come from upstream and sign in to Microsoft's servers.

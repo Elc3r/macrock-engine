@@ -6,8 +6,9 @@
 # answers xgameruntime's Xodus IPC on the socket in XODUS_SOCKET, keeping the Microsoft account's
 # credentials in the Keychain service named by XODUS_KEYCHAIN_SERVICE. Also builds xodus-cli into
 # $WORK/bin, a development tool kept out of the runtime, whose `login` signs an account in there.
-# Both are signed with SIGNING_IDENTITY when set (a fixed identity keeps the Keychain's "Always
-# Allow" across rebuilds), otherwise ad hoc.
+# Both are signed with SIGNING_IDENTITY when set, otherwise ad hoc. The Keychain's "Always Allow"
+# holds for one build only: an item names every build it allows by its code directory hash, so a
+# rebuilt service asks again, once per item.
 #
 # Environment: JOBS (default 4), ENGINE_WORK, SIGNING_IDENTITY. Run build.sh first.
 set -eu

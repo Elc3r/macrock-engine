@@ -1,11 +1,12 @@
 #!/bin/sh
 # run.sh [RUNTIME]: sign in for real through xgameruntime and the Xodus service.
 #
-# Runs xgameruntime's XUserLiveTests: XUserAddAsync gets MSA tickets from the Xodus service at
-# XODUS_SOCKET (which must have a signed-in account, e.g. one added with
+# Runs xgameruntime's XUserLiveTests and XStoreLiveTests. XUserAddAsync gets MSA tickets from the
+# Xodus service at XODUS_SOCKET (which must have a signed-in account, e.g. one added with
 # `XODUS_KEYCHAIN_SERVICE=... $ENGINE_WORK/bin/xodus-cli login`) and signs in to Xbox Live
 # through SISU; XUserGetTokenAndSignature then gets tokens that profile.xboxlive.com,
-# title.mgt.xboxlive.com and (for Minecraft) Realms accept. The tests need the title's own
+# title.mgt.xboxlive.com and (for Minecraft) Realms accept; the Store gives the account's game
+# license and the title's products from the catalog. The tests need the title's own
 # MicrosoftGame.config for its title and MSA app ids: GAME_CONFIG. They print no personal data:
 # statuses, counts and lengths.
 set -eu

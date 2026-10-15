@@ -34,12 +34,13 @@ gh release create "$TAG" --repo "$REPO" --draft --target "$head" --title "macroc
 macrock-engine $VERSION (build $(json_get "$INDEX" build)), from commit $head.
 
 - \`$bundle\`: the runtime, a sealed macOS bundle (Wine $(pin wine ref) with our patches, xgameruntime). SHA-256 $(json_get "$INDEX" bundle.sha256).
-- \`$helper\`: xodus-service for the launcher's app bundle, with its licenses. SHA-256 $(json_get "$INDEX" helper.sha256).
-- \`index.json\`: what a launcher reads first (sizes, SHA-256, requirements).
+- \`$helper\`: xodus-service for the launcher's app bundle, with its licenses, its sources and the messages of its launcher channel (\`proto/\`). SHA-256 $(json_get "$INDEX" helper.sha256).
+- \`index.json\`: what a launcher reads first (sizes, SHA-256, the bundle's code directory hash,
+  the service protocol, requirements).
 - \`SOURCES.md\`: the upstream commits and patches the runtime was built from.
 
 Requires an Apple Silicon Mac with macOS $(json_get "$INDEX" requires.macos) and Rosetta 2, Apple's Game Porting Toolkit $(json_get "$INDEX" requires.gptk) (not
 included) and a Microsoft account that owns Minecraft for Windows. Experimental: see the README's
-"What works" and docs/known-issues.md.
+"Status" and docs/known-issues.md.
 EOF
 info "Draft ready: check it on GitHub, then publish it there or with: gh release edit $TAG --repo $REPO --draft=false"

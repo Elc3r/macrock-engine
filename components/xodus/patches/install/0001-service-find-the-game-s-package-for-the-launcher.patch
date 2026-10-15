@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:48:26 +0200
+Subject: [PATCH] service: find the game's package for the launcher.
+
+LAUNCHER_PACKAGE takes a game's Store ID and a market, and answers with the version of the
+package Microsoft serves now and the size of its download, without downloading it. The store's
+catalog names the package's content for Windows desktops, and the Xbox package service describes
+it, given an Xbox token of the user for http://update.xboxlive.com. That token comes from the same
+chain as the gamertag's, now shared. Patches from earlier versions (.xsp) do not count in the
+size.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: install
+---
+ crates/xodus-service/src/account.rs     |  24 +++-
+ crates/xodus-service/src/launcher.rs    |  11 +-
+ crates/xodus-service/src/main.rs        |   1 +
+ crates/xodus-service/src/package.rs     | 178 ++++++++++++++++++++++++
+ crates/xodus/proto/xodus/common.proto   |   2 +
+ crates/xodus/proto/xodus/launcher.proto |  25 ++++
+ 6 files changed, 233 insertions(+), 8 deletions(-)
+ create mode 100644 crates/xodus-service/src/package.rs
+
+diff --git a/crates/xodus-service/src/account.rs b/crates/xodus-service/src/account.rs
+index ecadb7197e8572adcef9b0866c6823552aa8c0e8..4ab2822c2c5cb5646219ec1ff7fd7e83429403aa 100644
+--- a/crates/xodus-service/src/account.rs
++++ b/crates/xodus-service/src/account.rs
+@@ -4,6 +4,7 @@ use xodus::api::xbox::{authenticate_xbox_user, request_xsts_token};
+ use xodus::models::live::{DAProperty, ExchangeUserTokenOutcome};
+ use xodus::models::secrets::{LegacyToken, Token, User};
+ use xodus::models::soap;
++use xodus::models::xbox::XstsResponse;
+ use xodus::proto::xodus::account_status::State;
+ use xodus::proto::xodus::failure::Reason;
+ use xodus::proto::xodus::{
+@@ -214,6 +215,18 @@ fn state(tokens: &TokenManager) -> Result<State, Failure> {
+ }
+ 
+ async fn gamertag(context: &SimpleContext) -> Result<String, Failure> {
++    let xsts = xbox_token(context, XBOX_LIVE).await?;
++    xsts.gamertag().map(str::to_string).ok_or_else(|| {
++        tracing::warn!("No gamertag in the Xbox token");
++        failure(Reason::Unavailable)
++    })
++}
++
++/// The signed-in user's Xbox token for `relying_party`, from the user's token.
++pub async fn xbox_token(
++    context: &SimpleContext,
++    relying_party: &str,
++) -> Result<XstsResponse, Failure> {
+     use soap::BodyContent::{RequestSecurityTokenResponse, RequestSecurityTokenResponseCollection};
+ 
+     let tokens = context.tokens();
+@@ -225,7 +238,7 @@ async fn gamertag(context: &SimpleContext) -> Result<String, Failure> {
+     };
+     let device = context.device_token().await.map_err(device_failure)?;
+     let unavailable = |err: &dyn std::fmt::Display| {
+-        tracing::warn!("No Xbox profile: {err}");
++        tracing::warn!("No Xbox token: {err}");
+         failure(Reason::Unavailable)
+     };
+     let exchanged = xodus::api::live::exchange_user_token(
+@@ -266,12 +279,9 @@ async fn gamertag(context: &SimpleContext) -> Result<String, Failure> {
+     let user_token = authenticate_xbox_user(&context.client, ticket)
+         .await
+         .map_err(|err| unavailable(&err))?;
+-    let xsts = request_xsts_token(&context.client, user_token.token, XBOX_LIVE)
++    request_xsts_token(&context.client, user_token.token, relying_party)
+         .await
+-        .map_err(|err| unavailable(&err))?;
+-    xsts.gamertag()
+-        .map(str::to_string)
+-        .ok_or_else(|| unavailable(&"no gamertag in the Xbox token"))
++        .map_err(|err| unavailable(&err))
+ }
+ 
+ /// A keychain read: a missing or unreadable item is None, a refusal a failure.
+@@ -306,7 +316,7 @@ fn refusal(pp: Option<soap::PP>) -> Failure {
+     }
+ }
+ 
+-fn failure(reason: Reason) -> Failure {
++pub fn failure(reason: Reason) -> Failure {
+     Failure {
+         reason: reason.into(),
+         status: 0,
+diff --git a/crates/xodus-service/src/launcher.rs b/crates/xodus-service/src/launcher.rs
+index f1e329517fe46d903bf97ddb692260722e0a2ec0..cd3dce965c92d81e5aecd74ca624fa99dc9f7e1d 100644
+--- a/crates/xodus-service/src/launcher.rs
++++ b/crates/xodus-service/src/launcher.rs
+@@ -7,7 +7,7 @@ use std::os::fd::FromRawFd;
+ use prost::Message;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::UnixStream;
+-use xodus::proto::xodus::{Hello, SignIn, SignOut, XodusMessageType};
++use xodus::proto::xodus::{Hello, Package, SignIn, SignOut, XodusMessageType};
+ 
+ use crate::PROTO_MAGIC;
+ use crate::simple_context::SimpleContext;
+@@ -93,6 +93,15 @@ pub async fn serve(mut channel: UnixStream, context: SimpleContext) {
+             Ok(XodusMessageType::LauncherProfile) => {
+                 crate::account::profile(&context).await.encode_to_vec()
+             }
++            Ok(XodusMessageType::LauncherPackage) => match Package::decode(payload.as_slice()) {
++                Ok(request) => crate::package::package(&context, request)
++                    .await
++                    .encode_to_vec(),
++                Err(err) => {
++                    tracing::error!("Unreadable PACKAGE on the launcher channel: {err}");
++                    Vec::new()
++                }
++            },
+             _ => Vec::new(),
+         };
+         let frame = crate::connection::encode_message(PROTO_MAGIC, message_type + 1, reply);
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index c67f67cbb91ed2d3cd28eb02b60d968c457e5df2..a3a412016f9fcb1182c35cc9d66df15f916d98de 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -18,6 +18,7 @@ use crate::simple_context::SimpleContext;
+ mod account;
+ mod connection;
+ mod launcher;
++mod package;
+ mod simple_context;
+ mod utils;
+ 
+diff --git a/crates/xodus-service/src/package.rs b/crates/xodus-service/src/package.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..76b576b43619109c3e005ae302fa1dcba04df2f1
+--- /dev/null
++++ b/crates/xodus-service/src/package.rs
+@@ -0,0 +1,178 @@
++//! The package Microsoft serves now for a game: the store's catalog names it, and the Xbox
++//! package service describes it to the signed-in user.
++
++use xodus::XBOX_LIVE_PACKAGES_PC;
++use xodus::api::displaycatalog::find_products_by_id;
++use xodus::models::displaycatalog::DisplayCatalogProductsResponse;
++use xodus::models::packagespc::{PackageDetails, PackageResponse};
++use xodus::proto::xodus::failure::Reason;
++use xodus::proto::xodus::{Failure, GamePackage, Package, PackageResult, package_result};
++
++use crate::account::{failure, xbox_token};
++use crate::simple_context::SimpleContext;
++
++/// The relying party of the Xbox token the package service takes.
++const XBOX_UPDATE: &str = "http://update.xboxlive.com";
++
++/// The game's package as Microsoft serves it now, without downloading it.
++pub async fn package(context: &SimpleContext, request: Package) -> PackageResult {
++    let outcome = match find(context, &request).await {
++        Ok(details) => {
++            let package = summary(&details);
++            tracing::info!(
++                "The game's package is version {}, {} bytes",
++                package.version,
++                package.size
++            );
++            package_result::Outcome::Package(package)
++        }
++        Err(failure) => package_result::Outcome::Failure(failure),
++    };
++    PackageResult {
++        outcome: Some(outcome),
++    }
++}
++
++/// The package's details, which the package service gives with an Xbox token of the user.
++async fn find(context: &SimpleContext, request: &Package) -> Result<PackageDetails, Failure> {
++    let unavailable = |err: &dyn std::fmt::Display| {
++        tracing::warn!("The game's package was not found: {err}");
++        failure(Reason::Unavailable)
++    };
++    let catalog = find_products_by_id(
++        &context.client,
++        request.product_id.clone(),
++        request.market.clone(),
++        vec!["en".to_string(), "neutral".to_string()],
++    )
++    .await
++    .map_err(|err| unavailable(&err))?;
++    let content_id =
++        desktop_content_id(&catalog).ok_or_else(|| unavailable(&"no package for Windows"))?;
++    let xsts = xbox_token(context, XBOX_UPDATE).await?;
++    let user_hash = xsts
++        .user_hash()
++        .ok_or_else(|| unavailable(&"no user hash in the Xbox token"))?;
++    let response = context
++        .client
++        .get(format!(
++            "{XBOX_LIVE_PACKAGES_PC}/GetBasePackage/{content_id}"
++        ))
++        .header("x-xbl-contract-version", "3")
++        .header(
++            "Authorization",
++            format!("XBL3.0 x={user_hash};{}", xsts.token),
++        )
++        .send()
++        .await
++        .and_then(reqwest::Response::error_for_status)
++        .map_err(|err| unavailable(&err))?;
++    match response
++        .json::<PackageResponse>()
++        .await
++        .map_err(|err| unavailable(&err))?
++    {
++        PackageResponse::Found(details) => Ok(details),
++        PackageResponse::NotFound { .. } => Err(unavailable(&"the package service has none")),
++    }
++}
++
++/// The content ID of the catalog's package for Windows desktops.
++fn desktop_content_id(catalog: &DisplayCatalogProductsResponse) -> Option<&str> {
++    catalog
++        .product
++        .display_sku_availabilities
++        .iter()
++        .flat_map(|availability| &availability.sku.properties.packages)
++        .find(|package| {
++            package
++                .platform_dependencies
++                .iter()
++                .any(|dependency| dependency.platform_name == "Windows.Desktop")
++        })
++        .and_then(|package| package.content_id.as_deref())
++}
++
++/// The game's version, and the size of the package to download. The service gives the version
++/// followed by the content's identifier (`1.26.5203.0.4650c7c5-…`); patches from earlier
++/// versions (`.xsp`) come with the package and are not downloaded.
++fn summary(details: &PackageDetails) -> GamePackage {
++    GamePackage {
++        version: details
++            .version
++            .split('.')
++            .take(4)
++            .collect::<Vec<_>>()
++            .join("."),
++        size: details
++            .package_files
++            .iter()
++            .filter(|file| file.file_name.ends_with(".msixvc"))
++            .map(|file| u64::try_from(file.file_size).unwrap_or_default())
++            .sum(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn takes_the_package_for_windows_desktops() {
++        let catalog: DisplayCatalogProductsResponse = serde_json::from_str(
++            r#"{"Product": {"DisplaySkuAvailabilities": [{"Availabilities": [], "Sku": {
++                "Properties": {"Packages": [
++                    {"ContentId": "console", "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]},
++                    {"ContentId": "desktop", "PlatformDependencies": [{"PlatformName": "Windows.Desktop"}]}
++                ]}}}]}}"#,
++        )
++        .unwrap();
++        assert_eq!(desktop_content_id(&catalog), Some("desktop"));
++    }
++
++    #[test]
++    fn has_no_package_without_one_for_windows_desktops() {
++        let catalog: DisplayCatalogProductsResponse = serde_json::from_str(
++            r#"{"Product": {"DisplaySkuAvailabilities": [{"Availabilities": [], "Sku": {
++                "Properties": {"Packages": [
++                    {"ContentId": "console", "PlatformDependencies": [{"PlatformName": "Windows.Xbox"}]}
++                ]}}}]}}"#,
++        )
++        .unwrap();
++        assert_eq!(desktop_content_id(&catalog), None);
++    }
++
++    #[test]
++    fn sizes_the_download_by_its_package_files() {
++        let file = |name: &str, size: i64| {
++            format!(
++                r#"{{"ContentId": "c", "VersionId": "v", "FileName": "{name}", "FileSize": {size},
++                "FileHash": "", "KeyBlob": "", "CdnRootPaths": [], "BackgroundCdnRootPaths": [],
++                "RelativeUrl": "/{name}", "UpdateType": 0, "LicenseUsageType": 0,
++                "ModifiedDate": "2026-10-01T00:00:00Z"}}"#
++            )
++        };
++        let details: PackageDetails = serde_json::from_str(&format!(
++            r#"{{"PackageFound": true, "ContentId": "c", "VersionId": "v",
++            "Version": "1.26.5203.0.4650c7c5-9163-48e9-9e89-6a5584d9833f",
++            "UpdatePredownload": false,
++            "AvailabilityDate": "2026-10-01T00:00:00Z", "PackageFiles": [{}, {}]}}"#,
++            file(
++                "Microsoft.MinecraftUWP_1.26.5203.0_x64__8wekyb3d8bbwe.msixvc",
++                2_069_975_040
++            ),
++            file(
++                "update-1.26.5101.0.d8c5d0b8-98a0-4965-9be6-8650afed6611.xsp",
++                7_328
++            )
++        ))
++        .unwrap();
++        assert_eq!(
++            summary(&details),
++            GamePackage {
++                version: "1.26.5203.0".to_string(),
++                size: 2_069_975_040,
++            }
++        );
++    }
++}
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index 074a09d4b471b173c3cbc3fd298c6f024e605976..2c06aa47011b3ee317aedd459389aeb735228464 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -22,4 +22,6 @@ enum XodusMessageType {
+     LAUNCHER_ACCOUNT_STATUS_RESPONSE=207;
+     LAUNCHER_PROFILE=208;
+     LAUNCHER_PROFILE_RESPONSE=209;
++    LAUNCHER_PACKAGE=210;
++    LAUNCHER_PACKAGE_RESPONSE=211;
+ }
+diff --git a/crates/xodus/proto/xodus/launcher.proto b/crates/xodus/proto/xodus/launcher.proto
+index d7265e6d6db7d476ee3d015d2ae9491da61b2b96..bbd367eea0836cebd90f0309ecd275f81e6829d7 100644
+--- a/crates/xodus/proto/xodus/launcher.proto
++++ b/crates/xodus/proto/xodus/launcher.proto
+@@ -85,6 +85,29 @@ message Profile {
+     string gamertag = 1;
+ }
+ 
++// LAUNCHER_PACKAGE: the package Microsoft serves now for a game, found without downloading it.
++message Package {
++    // The game's Store ID, such as 9NBLGGH2JHXJ.
++    string product_id = 1;
++    // The market whose catalog names the package, a region such as US.
++    string market = 2;
++}
++
++// The response to LAUNCHER_PACKAGE.
++message PackageResult {
++    oneof outcome {
++        GamePackage package = 1;
++        Failure failure = 2;
++    }
++}
++
++message GamePackage {
++    // The game's version, such as 1.26.5203.0.
++    string version = 1;
++    // The size of the download, in bytes.
++    uint64 size = 2;
++}
++
+ // Why a request of the launcher failed.
+ message Failure {
+     enum Reason {
+@@ -99,6 +122,8 @@ message Failure {
+         REASON_KEYCHAIN = 4;
+         // No user is signed in.
+         REASON_NOT_SIGNED_IN = 5;
++        // The user does not own the game.
++        REASON_NOT_OWNED = 6;
+     }
+     Reason reason = 1;
+     // For REASON_REFUSED, Microsoft's status (an HRESULT such as 0x80048821) when it gave one.

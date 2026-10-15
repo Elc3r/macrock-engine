@@ -1,0 +1,530 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 01:38:01 +0200
+Subject: [PATCH] service: sign in on the launcher channel.
+
+LAUNCHER_SIGN_IN carries what Microsoft's sign-in page posted, its ServerData. The service
+registers the device if it is not registered yet, exchanges the page's token for the account's
+tokens as xodus-cli login does, and keeps them in its Keychain service with the user. SignInResult
+says that the user is signed in, that Microsoft wants the user on another page first
+(inline_auth_url, whose data comes in a second SIGN_IN), or why the sign-in failed.
+
+The keychain is now opened before the channel is served, and a panic in the channel's task stops
+the service, as closing the channel does.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: account
+---
+ crates/xodus-service/src/account.rs        | 277 +++++++++++++++++++++
+ crates/xodus-service/src/launcher.rs       |  14 +-
+ crates/xodus-service/src/main.rs           |  46 ++--
+ crates/xodus-service/src/simple_context.rs |  11 +-
+ crates/xodus/proto/xodus/common.proto      |   2 +
+ crates/xodus/proto/xodus/launcher.proto    |  41 +++
+ 6 files changed, 366 insertions(+), 25 deletions(-)
+ create mode 100644 crates/xodus-service/src/account.rs
+
+diff --git a/crates/xodus-service/src/account.rs b/crates/xodus-service/src/account.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..acd9cb14b5346af09ac05579a6f42eb1b34f953f
+--- /dev/null
++++ b/crates/xodus-service/src/account.rs
+@@ -0,0 +1,277 @@
++//! The account's operations the launcher asks for on its channel.
++
++use xodus::models::live::{DAProperty, ExchangeUserTokenOutcome};
++use xodus::models::secrets::{LegacyToken, Token, User};
++use xodus::models::soap;
++use xodus::proto::xodus::failure::Reason;
++use xodus::proto::xodus::sign_in_result::Outcome;
++use xodus::proto::xodus::{Failure, SignIn, SignInResult, SignedIn};
++use xodus::tokens::TokenManager;
++use xodus::tokens::device::DeviceError;
++
++use crate::simple_context::SimpleContext;
++
++// The client and scopes of xodus-cli login, whose flow signing in follows.
++const CLIENT_ID: &str = "000000004424da1f";
++const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
++const TOKEN_BROKER_SCOPE: &str = "http://Passport.NET/tb";
++
++/// Exchanges what the sign-in page posted for the account's tokens and keeps them with the user,
++/// registering the device first if it is not registered yet.
++pub async fn sign_in(context: &SimpleContext, request: SignIn) -> SignInResult {
++    let outcome = exchange(context, request)
++        .await
++        .unwrap_or_else(Outcome::Failure);
++    SignInResult {
++        outcome: Some(outcome),
++    }
++}
++
++async fn exchange(context: &SimpleContext, request: SignIn) -> Result<Outcome, Failure> {
++    let page = serde_json::from_str::<DAProperty>(&request.server_data)
++        .map_err(|_| failure(Reason::InvalidServerData))?;
++    let device = context.register_device().await.map_err(|err| {
++        tracing::warn!("The device could not sign in: {err}");
++        failure(match err {
++            DeviceError::Keychain(_) => Reason::Keychain,
++            DeviceError::Microsoft(_) | DeviceError::NotRegistered => Reason::Unavailable,
++        })
++    })?;
++    let mut scopes = vec![(
++        USER_AUTH_SCOPE.to_string(),
++        Some(soap::PolicyReference::token_broker()),
++    )];
++    if request.inline_auth {
++        scopes.push((TOKEN_BROKER_SCOPE.to_string(), None));
++    }
++    let user = User {
++        puid: page.puid,
++        username: page.username.clone(),
++    };
++    let user_token = LegacyToken {
++        key_name: None,
++        token: page.da_token,
++        binary_secret: None,
++        tpm_key: None,
++        lifetime: soap::Timestamp {
++            id: None,
++            created: page.da_start_time,
++            expires: page.da_expires,
++        },
++    };
++    let exchanged = xodus::api::live::exchange_user_token(
++        &context.client,
++        user_token,
++        page.username,
++        device,
++        Some(page.sts_inline_flow_token),
++        None,
++        CLIENT_ID.to_string(),
++        &scopes,
++    )
++    .await
++    .map_err(|err| {
++        tracing::warn!("Microsoft did not exchange the user's token: {err}");
++        failure(Reason::Unavailable)
++    })?;
++    conclude(context.tokens(), &user, exchanged)
++}
++
++/// What Microsoft's answer to the exchange means for the launcher.
++fn conclude(
++    tokens: &TokenManager,
++    user: &User,
++    exchanged: ExchangeUserTokenOutcome,
++) -> Result<Outcome, Failure> {
++    use soap::BodyContent::{RequestSecurityTokenResponse, RequestSecurityTokenResponseCollection};
++
++    match exchanged {
++        ExchangeUserTokenOutcome::Fault(Some(soap::PP {
++            inline_auth_url: Some(url),
++            ..
++        })) => {
++            tracing::info!("Microsoft asked for another sign-in page");
++            Ok(Outcome::InlineAuthUrl(url))
++        }
++        ExchangeUserTokenOutcome::Fault(pp) => {
++            let status = pp
++                .and_then(|pp| pp.req_status)
++                .and_then(|status| hresult(&status))
++                .unwrap_or_default();
++            tracing::warn!("Microsoft refused the sign-in: {status:#010x}");
++            Err(Failure {
++                reason: Reason::Refused.into(),
++                status,
++            })
++        }
++        ExchangeUserTokenOutcome::Issued(RequestSecurityTokenResponseCollection(collection)) => {
++            keep(tokens, user, collection.security_tokens)
++        }
++        ExchangeUserTokenOutcome::Issued(RequestSecurityTokenResponse(response)) => {
++            keep(tokens, user, vec![*response])
++        }
++        ExchangeUserTokenOutcome::Issued(_) => {
++            tracing::warn!("Microsoft answered the sign-in without tokens");
++            Err(failure(Reason::Unavailable))
++        }
++    }
++}
++
++/// Keeps the issued tokens, then the user, which marks a sign-in that completed.
++fn keep(
++    tokens: &TokenManager,
++    user: &User,
++    issued: Vec<soap::RequestSecurityTokenResponse>,
++) -> Result<Outcome, Failure> {
++    issued
++        .into_iter()
++        .try_for_each(|response| {
++            let address = response.applies_to.endpoint_reference.address.clone();
++            let token = Token::from(response);
++            // Requests look up the user's STS token, a legacy one, by its key name.
++            let address = match &token {
++                Token::Legacy(LegacyToken {
++                    key_name: Some(name),
++                    ..
++                }) => name.clone(),
++                _ => address,
++            };
++            tokens.save_user_token(address, token)
++        })
++        .and_then(|()| tokens.save_user(user))
++        .map_err(|err| {
++            tracing::error!("The sign-in's tokens were not kept: {err}");
++            failure(Reason::Keychain)
++        })?;
++    tracing::info!("Signed in");
++    Ok(Outcome::SignedIn(SignedIn {}))
++}
++
++fn failure(reason: Reason) -> Failure {
++    Failure {
++        reason: reason.into(),
++        status: 0,
++    }
++}
++
++/// Microsoft's status, written as `0x80048821`.
++fn hresult(status: &str) -> Option<u32> {
++    u32::from_str_radix(status.strip_prefix("0x")?, 16).ok()
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++
++    use super::*;
++
++    fn user() -> User {
++        User {
++            puid: "0001000000000001".to_string(),
++            username: "player@example.com".to_string(),
++        }
++    }
++
++    fn fault(inline_auth_url: Option<&str>, req_status: Option<&str>) -> ExchangeUserTokenOutcome {
++        ExchangeUserTokenOutcome::Fault(Some(soap::PP {
++            xmlns_psf: None,
++            server_version: None,
++            req_status: req_status.map(str::to_string),
++            inline_auth_url: inline_auth_url.map(str::to_string),
++            inline_end_auth_url: None,
++            auth_state_internal: None,
++            user_session_key: None,
++        }))
++    }
++
++    fn compact_token(address: &str, value: &str) -> soap::RequestSecurityTokenResponse {
++        soap::RequestSecurityTokenResponse {
++            token_type: "urn:passport:compact".to_string(),
++            applies_to: soap::AppliesTo {
++                endpoint_reference: soap::EndpointReference {
++                    address: address.to_string(),
++                },
++            },
++            lifetime: soap::Timestamp {
++                id: None,
++                created: "2026-10-10T00:00:00Z".to_string(),
++                expires: "2026-10-11T00:00:00Z".to_string(),
++            },
++            requested_security_token: soap::RequestedSecurityToken {
++                encrypted_data: None,
++                binary_security_token: Some(soap::BinarySecurityTokenRes {
++                    id: "Compact0".to_string(),
++                    value: value.to_string(),
++                    value_type: None,
++                }),
++            },
++            requested_proof_token: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn refuses_data_that_no_sign_in_page_posted() {
++        let context = SimpleContext::new(Arc::new(TokenManager::with_memory()));
++        let request = SignIn {
++            server_data: r#"{"sDAToken": "t=token"}"#.to_string(),
++            inline_auth: false,
++        };
++        assert_eq!(
++            sign_in(&context, request).await.outcome,
++            Some(Outcome::Failure(failure(Reason::InvalidServerData)))
++        );
++    }
++
++    #[test]
++    fn sends_the_user_to_the_page_microsoft_names() {
++        let tokens = TokenManager::with_memory();
++        let url = "https://login.live.com/inline";
++        let outcome = conclude(&tokens, &user(), fault(Some(url), None));
++        assert_eq!(outcome, Ok(Outcome::InlineAuthUrl(url.to_string())));
++        assert!(tokens.get_user().is_err());
++    }
++
++    #[test]
++    fn reports_the_status_microsoft_refused_with() {
++        let tokens = TokenManager::with_memory();
++        let outcome = conclude(&tokens, &user(), fault(None, Some("0x80048821")));
++        assert_eq!(
++            outcome,
++            Err(Failure {
++                reason: Reason::Refused.into(),
++                status: 0x8004_8821,
++            })
++        );
++        assert!(tokens.get_user().is_err());
++    }
++
++    #[test]
++    fn keeps_the_issued_tokens_and_the_user() {
++        let tokens = TokenManager::with_memory();
++        let issued = soap::RequestSecurityTokenResponseCollection {
++            security_tokens: vec![
++                compact_token("user.auth.xboxlive.com", "t=user"),
++                compact_token("http://Passport.NET/tb", "t=broker"),
++            ],
++        };
++        let exchanged = ExchangeUserTokenOutcome::Issued(
++            soap::BodyContent::RequestSecurityTokenResponseCollection(issued),
++        );
++        assert_eq!(
++            conclude(&tokens, &user(), exchanged),
++            Ok(Outcome::SignedIn(SignedIn {}))
++        );
++        assert!(matches!(
++            tokens.get_user_token_for("user.auth.xboxlive.com"),
++            Ok(Some(Token::Compact(token))) if token == "t=user"
++        ));
++        assert!(matches!(
++            tokens.get_user_token_for("http://Passport.NET/tb"),
++            Ok(Some(Token::Compact(token))) if token == "t=broker"
++        ));
++        assert_eq!(
++            tokens.get_user().map(|user| user.username).ok(),
++            Some("player@example.com".to_string())
++        );
++    }
++}
+diff --git a/crates/xodus-service/src/launcher.rs b/crates/xodus-service/src/launcher.rs
+index 03dd8c965268026bc298f6d31d8f435d9d1a48a8..a32612cd7aa56487c26257cb28f7a86d59068d5f 100644
+--- a/crates/xodus-service/src/launcher.rs
++++ b/crates/xodus-service/src/launcher.rs
+@@ -7,9 +7,10 @@ use std::os::fd::FromRawFd;
+ use prost::Message;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::UnixStream;
+-use xodus::proto::xodus::{Hello, XodusMessageType};
++use xodus::proto::xodus::{Hello, SignIn, XodusMessageType};
+ 
+ use crate::PROTO_MAGIC;
++use crate::simple_context::SimpleContext;
+ 
+ /// The version of the channel's messages, which HELLO tells the launcher.
+ const PROTOCOL: u32 = 1;
+@@ -45,7 +46,7 @@ pub fn open() -> Result<Option<UnixStream>, String> {
+ }
+ 
+ /// Answers the launcher's messages until it closes the channel.
+-pub async fn serve(mut channel: UnixStream) {
++pub async fn serve(mut channel: UnixStream, context: SimpleContext) {
+     loop {
+         let mut header = [0; 8];
+         if let Err(err) = channel.read_exact(&mut header).await {
+@@ -68,6 +69,15 @@ pub async fn serve(mut channel: UnixStream) {
+         }
+         let reply = match XodusMessageType::try_from(i32::from(message_type)) {
+             Ok(XodusMessageType::LauncherHello) => Hello { protocol: PROTOCOL }.encode_to_vec(),
++            Ok(XodusMessageType::LauncherSignIn) => match SignIn::decode(payload.as_slice()) {
++                Ok(request) => crate::account::sign_in(&context, request)
++                    .await
++                    .encode_to_vec(),
++                Err(err) => {
++                    tracing::error!("Unreadable SIGN_IN on the launcher channel: {err}");
++                    Vec::new()
++                }
++            },
+             _ => Vec::new(),
+         };
+         let frame = crate::connection::encode_message(PROTO_MAGIC, message_type + 1, reply);
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 584efc61574949c589252ffe8572e8e9a1adfef6..c67f67cbb91ed2d3cd28eb02b60d968c457e5df2 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -13,6 +13,9 @@ use tracing_subscriber::util::SubscriberInitExt;
+ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
+ 
++use crate::simple_context::SimpleContext;
++
++mod account;
+ mod connection;
+ mod launcher;
+ mod simple_context;
+@@ -77,32 +80,36 @@ async fn run() -> ExitCode {
+             return ExitCode::from(status::CONFIG);
+         }
+     };
+-    // The launcher closing its channel stops the service as a signal does.
++    if let Err(err) = xodus::secrets::init_secrets() {
++        tracing::error!("keychain: {err}");
++        return ExitCode::from(status::NO_PERMISSION);
++    }
++    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
++    // The launcher closing its channel stops the service as a signal does; so does a panic in
++    // the channel's task.
+     let closed = CancellationToken::new();
+     if let Some(channel) = channel {
+-        let closed = closed.clone();
++        let context = SimpleContext::new(tokens.clone());
++        let closing = closed.clone().drop_guard();
+         tokio::spawn(async move {
+-            launcher::serve(channel).await;
+-            closed.cancel();
++            let _closing = closing;
++            launcher::serve(channel, context).await;
+         });
+     }
+     // Reading the keychain blocks the thread while macOS asks the user, so the start runs as a
+     // task of its own.
+     let started = tokio::select! {
+-        started = tokio::spawn(start()) => match started {
++        started = tokio::spawn(start(SimpleContext::new(tokens.clone()))) => match started {
+             Ok(started) => started,
+             Err(err) => std::panic::resume_unwind(err.into_panic()),
+         },
+         () = stop.received() => return ExitCode::SUCCESS,
+         () = closed.cancelled() => return ExitCode::SUCCESS,
+     };
+-    let tokens = match started {
+-        Ok(started) => started,
+-        Err((status, message)) => {
+-            tracing::error!("{message}");
+-            return ExitCode::from(status);
+-        }
+-    };
++    if let Err((status, message)) = started {
++        tracing::error!("{message}");
++        return ExitCode::from(status);
++    }
+ 
+     let socket_path = std::env::var("XODUS_SOCKET")
+         .ok()
+@@ -145,14 +152,11 @@ async fn run() -> ExitCode {
+     ExitCode::SUCCESS
+ }
+ 
+-/// Opens the keychain and renews the device's token if the device is registered: a refusal of
+-/// the keychain shows at once, with the exit status that names it. Signing in registers the
+-/// device; until then, and while Microsoft can't be reached, requests get no tokens.
+-async fn start() -> Result<Arc<TokenManager>, (u8, String)> {
+-    xodus::secrets::init_secrets()
+-        .map_err(|err| (status::NO_PERMISSION, format!("keychain: {err}")))?;
+-    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
+-    match xodus::tokens::device::device_token(&reqwest::Client::new(), &tokens).await {
++/// Renews the device's token if the device is registered: a refusal of the keychain shows at
++/// once, with the exit status that names it. Signing in registers the device; until then, and
++/// while Microsoft can't be reached, requests get no tokens.
++async fn start(context: SimpleContext) -> Result<(), (u8, String)> {
++    match context.device_token().await {
+         Ok(_) => {}
+         Err(DeviceError::NotRegistered) => tracing::info!("The device is not registered yet"),
+         Err(DeviceError::Microsoft(err)) => {
+@@ -162,7 +166,7 @@ async fn start() -> Result<Arc<TokenManager>, (u8, String)> {
+             return Err((status::NO_PERMISSION, err.to_string()));
+         }
+     }
+-    Ok(tokens)
++    Ok(())
+ }
+ 
+ /// SIGINT and SIGTERM, whichever comes first. Their handlers are installed on creation.
+diff --git a/crates/xodus-service/src/simple_context.rs b/crates/xodus-service/src/simple_context.rs
+index 5a8f500b4c173337ee563cfc48487f004b25c8cb..893989b9531c05a2470e69d659e541f7f46f31f5 100644
+--- a/crates/xodus-service/src/simple_context.rs
++++ b/crates/xodus-service/src/simple_context.rs
+@@ -7,8 +7,8 @@ use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
+ 
+-/// Held while the device's token is checked and renewed, so that requests arriving together
+-/// renew it once.
++/// Held while the device is registered, or its token checked and renewed, so that requests
++/// arriving together register or renew it once.
+ static DEVICE_TOKEN_RENEWAL: Mutex<()> = Mutex::const_new(());
+ 
+ pub struct SimpleContext {
+@@ -37,4 +37,11 @@ impl SimpleContext {
+         let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
+         xodus::tokens::device::device_token(&self.client, &self.tokens).await
+     }
++
++    /// The device's STS token, registering the device with Microsoft first if it is not
++    /// registered yet: what signing in needs.
++    pub async fn register_device(&self) -> Result<LegacyToken, DeviceError> {
++        let _renewal = DEVICE_TOKEN_RENEWAL.lock().await;
++        xodus::tokens::device::ensure_device_credentials(&self.client, &self.tokens).await
++    }
+ }
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index 6197db4ebb0fc6be8696acdc134f7b6fa3bf72c1..6621186b82bc41226c2da8ff2d66e52135551f25 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -14,4 +14,6 @@ enum XodusMessageType {
+     // The launcher channel's messages.
+     LAUNCHER_HELLO=200;
+     LAUNCHER_HELLO_RESPONSE=201;
++    LAUNCHER_SIGN_IN=202;
++    LAUNCHER_SIGN_IN_RESPONSE=203;
+ }
+diff --git a/crates/xodus/proto/xodus/launcher.proto b/crates/xodus/proto/xodus/launcher.proto
+index 9e95149bb18b0e48e5c7ba28cf82a3382f39401b..734e143444129b40230e1f061ebcc9392bf74faa 100644
+--- a/crates/xodus/proto/xodus/launcher.proto
++++ b/crates/xodus/proto/xodus/launcher.proto
+@@ -8,3 +8,44 @@ package xodus;
+ message Hello {
+     uint32 protocol = 1;
+ }
++
++// LAUNCHER_SIGN_IN: what Microsoft's sign-in page posted, for the service to exchange for the
++// account's tokens. The device is registered first if it is not yet.
++message SignIn {
++    // The JSON of the page's ServerData. The service reads only sDAToken, sDASessionKey,
++    // sDAStartTime, sDAExpires, sSTSInlineFlowToken, sSigninName and K, so it may hold only those.
++    string server_data = 1;
++    // Whether the page is the one a SignInResult's inline_auth_url named.
++    bool inline_auth = 2;
++}
++
++// The response to LAUNCHER_SIGN_IN.
++message SignInResult {
++    oneof outcome {
++        // The service keeps the tokens Microsoft issued, with the user.
++        SignedIn signed_in = 1;
++        // Microsoft wants the user on this page first; its ServerData comes in a new SIGN_IN.
++        string inline_auth_url = 2;
++        Failure failure = 3;
++    }
++}
++
++message SignedIn {}
++
++// Why a request of the launcher failed.
++message Failure {
++    enum Reason {
++        REASON_UNSPECIFIED = 0;
++        // A SIGN_IN's server_data is not what a sign-in page posts.
++        REASON_INVALID_SERVER_DATA = 1;
++        // Microsoft could not be reached, or gave an answer the service does not understand.
++        REASON_UNAVAILABLE = 2;
++        // Microsoft refused the sign-in, or the user's token: the user must sign in again.
++        REASON_REFUSED = 3;
++        // The keychain refused access to the credentials.
++        REASON_KEYCHAIN = 4;
++    }
++    Reason reason = 1;
++    // For REASON_REFUSED, Microsoft's status (an HRESULT such as 0x80048821) when it gave one.
++    uint32 status = 2;
++}

@@ -3,8 +3,8 @@
  * Games' HTTP (libHttpClient) relies on WinHTTP's own certificate validation; the GDK's
  * XNetworkingVerifyServerCertificate only adds pinning. This makes default-flag HTTPS requests
  * to badssl.com: the valid host must succeed, the broken ones (expired, wrong host, self-signed,
- * untrusted root) must fail. Prints one line per host and exits 0 when all behave. Needs the
- * network.
+ * untrusted root) must fail with a certificate error; a lookup failure or a timeout says nothing
+ * about validation. Prints one line per host and exits 0 when all behave. Needs the network.
  *
  * Build: x86_64-w64-mingw32-clang -O2 -o winhttp-tls-probe.exe winhttp-tls-probe.c -lwinhttp */
 #include <windows.h>
@@ -32,6 +32,25 @@ static DWORD request(const WCHAR *host)
     return error;
 }
 
+static BOOL certificate_error(DWORD error)
+{
+    switch (error)
+    {
+    case ERROR_WINHTTP_SECURE_FAILURE:
+    case ERROR_WINHTTP_SECURE_CHANNEL_ERROR:
+    case ERROR_WINHTTP_SECURE_INVALID_CA:
+    case ERROR_WINHTTP_SECURE_INVALID_CERT:
+    case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
+    case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
+    case ERROR_WINHTTP_SECURE_CERT_REV_FAILED:
+    case ERROR_WINHTTP_SECURE_CERT_REVOKED:
+    case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 int main(void)
 {
     static const struct { const WCHAR *host; BOOL valid; } hosts[] =
@@ -49,7 +68,7 @@ int main(void)
     {
         DWORD error = request(hosts[i].host);
         BOOL accepted = error == ERROR_SUCCESS;
-        BOOL right = accepted == hosts[i].valid;
+        BOOL right = hosts[i].valid ? accepted : certificate_error(error);
 
         printf("%s %ls: %s (error %lu)\n", right ? "ok  " : "BAD ", hosts[i].host,
                accepted ? "accepted" : "rejected", error);

@@ -9,9 +9,11 @@
 #     Contents/Resources/runtime/        Wine, xgameruntime.dll, the prefix setup, licenses
 #     Contents/_CodeSignature/           an ad hoc seal over all of it (codesign --verify)
 #   macrock-engine-<version>.aar         the bundle in an Apple Archive (lzma)
-#   xodus-service-<version>-arm64.aar    the Xodus service with its licenses, for the launcher's
-#                                        app bundle (where the launcher signs it), not the runtime
-#   index.json                           size and SHA-256 of both archives, and the requirements
+#   xodus-service-<version>-arm64.aar    the Xodus service with its licenses and the messages of
+#                                        its launcher channel (proto/), for the launcher's app
+#                                        bundle (where the launcher signs it), not the runtime
+#   index.json                           size and SHA-256 of both archives, the bundle's code
+#                                        directory hash, the service protocol and the requirements
 #
 # Development files (headers, import libraries, man pages, unversioned dylib links) stay out.
 # Every bundled dylib needs its license texts (licenses/dylibs.txt). Uncommitted work, or a tree
@@ -125,20 +127,25 @@ EOF
 $PYTHON "$HERE/manifest.py" write --runtime "$RUNTIME" --out "$RESOURCES/manifest.json" --version "$VERSION" \
   --build "$build" --target "$MACOS_DEPLOYMENT_TARGET" --engine-root "$ROOT" --work "$WORK" \
   --engine-commit "$engine_commit" ${problems:+--dirty} --component wine --component xgameruntime \
-  --gptk "$GPTK_REQUIRED" > /dev/null
+  --gptk "$GPTK_REQUIRED" --service-protocol "$SERVICE_PROTOCOL" > /dev/null
 
 info "Sealing $NAME.bundle (ad hoc)"
 codesign --force --sign - --timestamp=none "$BUNDLE"
 codesign --verify --strict "$BUNDLE"
+cdhash=$(codesign -dvvv "$BUNDLE" 2>&1 | sed -n 's/^CDHash=//p')
+[ -n "$cdhash" ] || die "no code directory hash for $NAME.bundle"
 info "Writing $NAME.aar"
 aa archive -D "$BUNDLE" -o "$OUT/$NAME.aar.part" -a lzma
 mv "$OUT/$NAME.aar.part" "$OUT/$NAME.aar"
 
 # The Xodus service, for the launcher: its own archive with its licenses (GPL-3.0 and the Rust
-# crates'). Signed ad hoc here; the launcher signs it with its own identity.
+# crates') and the .proto files of its launcher channel, which the launcher generates its code
+# from. Signed ad hoc here; the launcher signs it with its own identity.
 helper="$OUT/xodus-service-$VERSION"
-mkdir -p "$helper"
+mkdir -p "$helper/proto"
 cp "$DIST/libexec/xodus-service" "$helper/xodus-service"
+cp "$XODUS_SRC/crates/xodus/proto/xodus/common.proto" "$XODUS_SRC/crates/xodus/proto/xodus/launcher.proto" \
+  "$helper/proto/"
 codesign --force --sign - --timestamp=none --identifier dev.macrock.xodus-service "$helper/xodus-service"
 cp "$XODUS_SRC/LICENSE" "$helper/LICENSE"
 PATH="$(brew_prefix rustup)/bin:$PATH" $PYTHON "$HERE/crate-licenses.py" "$XODUS_SRC" xodus-service \
@@ -159,7 +166,7 @@ aa archive -D "$helper" -o "$OUT/xodus-service-$VERSION-arm64.aar" -a lzma
 rm -rf "$helper"
 
 $PYTHON "$HERE/manifest.py" index "$RESOURCES/manifest.json" "$OUT/$NAME.aar" \
-  "$OUT/xodus-service-$VERSION-arm64.aar" "$OUT/index.json"
+  "$OUT/xodus-service-$VERSION-arm64.aar" "$OUT/index.json" --bundle-cdhash "$cdhash"
 for file in "$NAME.aar" "xodus-service-$VERSION-arm64.aar"; do
   (cd "$OUT" && shasum -a 256 "$file" > "$file.sha256")
   info "$(du -h "$OUT/$file" | cut -f 1) $file ($(cut -d ' ' -f 1 < "$OUT/$file.sha256"))"

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 13:57:34 +0200
+Subject: [PATCH] msixvc: extract a Preview package's executable, which it
+ stores in the clear.
+
+Without segment metadata, every executable of a package counted as kept encrypted, so it was
+copied in whole pages for a decryption that never came: a Preview package, which keeps its
+executable in a region without a key, came out with an executable of another size. An executable
+now counts as kept encrypted only where the package encrypts it.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: install
+---
+ crates/msixvc/src/xvd.rs | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/crates/msixvc/src/xvd.rs b/crates/msixvc/src/xvd.rs
+index 6d5b2584bf39dd2359704ef0402040c2e0f7e911..796cc5da5c286851636e3e9de3a7d2bf720fd8da 100644
+--- a/crates/msixvc/src/xvd.rs
++++ b/crates/msixvc/src/xvd.rs
+@@ -308,6 +308,14 @@ impl XvdFile {
+         self.header.vduid
+     }
+ 
++    /// Whether the byte at `offset` lies in an encrypted section.
++    fn is_encrypted(&self, offset: u64) -> bool {
++        self.encrypted_section_infos.iter().any(|section| {
++            offset >= section.section_offset
++                && offset - section.section_offset < section.section_length
++        })
++    }
++
+     fn non_encrypted_prefix_len(&self, start: u64, len: u64) -> u64 {
+         let end = start.saturating_add(len);
+         let mut prefix_len = len;
+@@ -713,14 +721,19 @@ impl XvdFile {
+                     continue;
+                 }
+ 
++                let offset = partition_offset + start;
+                 files.insert(
+                     report.path.replace("/", "\\"),
+                     SegmentFile {
+-                        offset: partition_offset + start,
++                        offset,
+                         length: report.value_length,
+                         data_hashs: vec![],
++                        // Without segment metadata, an executable counts as kept encrypted only
++                        // where the package encrypts it: Preview packages store theirs in the
++                        // clear.
+                         keep_encrypted: !only_plain
+-                            && report.path.to_ascii_lowercase().ends_with(".exe"),
++                            && report.path.to_ascii_lowercase().ends_with(".exe")
++                            && self.is_encrypted(offset),
+                     },
+                 );
+             }

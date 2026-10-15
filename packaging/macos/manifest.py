@@ -2,16 +2,18 @@
 
   write OPTIONS        write Contents/Resources/manifest.json of a bundle
   verify RESOURCES     check the runtime against the manifest in RESOURCES
-  index MANIFEST BUNDLE HELPER OUT
+  index MANIFEST BUNDLE HELPER OUT --bundle-cdhash CDHASH
                        write the release index from the manifest and the two archives
 
 The manifest lists the SHA-256 of every regular file and the target of every symlink of the
 runtime directory, relative to it. It also records what the runtime was built from (the
 macrock-engine commit and, for each component, its pin and what tools/engine applied to its
-tree) and what it requires (macOS, Rosetta, the Game Porting Toolkit, the prefix setup).
+tree), what it requires (macOS, Rosetta, the Game Porting Toolkit, the prefix setup) and the
+protocol its xgameruntime speaks with xodus-service.
 
 The index is the file a launcher reads first: the size and SHA-256 of the archives it then
-downloads, what the runtime requires, and what it was built from.
+downloads, the code directory hash of the sealed bundle, the service protocol, what the runtime
+requires, and what it was built from.
 """
 import argparse
 import datetime
@@ -74,7 +76,7 @@ def write(args):
     setup = json.loads((args.runtime / setup_path).read_text())
     files, links = tree_contents(args.runtime)
     manifest = {
-        "schema": 4,
+        "schema": 5,
         "name": "macrock-engine",
         "version": args.version,
         "build": args.build,
@@ -83,6 +85,7 @@ def write(args):
         "components": components,
         "arch": "x86_64",
         "requires": {"macos": args.target, "rosetta": True, "gptk": args.gptk},
+        "service_protocol": args.service_protocol,
         "prefix_setup": {"path": setup_path, "schema": setup["schema"], "revision": setup["revision"]},
         "runtime": os.path.relpath(args.runtime, args.out.parent),
         "built": now(),
@@ -111,7 +114,7 @@ def index(args):
 
     version = manifest["version"]
     result = {
-        "schema": 1,
+        "schema": 2,
         "name": manifest["name"],
         "version": version,
         "build": manifest["build"],
@@ -120,10 +123,12 @@ def index(args):
         "dirty": manifest["dirty"],
         "arch": manifest["arch"],
         "requires": manifest["requires"],
+        "service_protocol": manifest["service_protocol"],
         "prefix_setup": {key: manifest["prefix_setup"][key] for key in ("schema", "revision")},
         "components": {name: {key: c[key] for key in ("url", "ref", "commit")}
                        for name, c in manifest["components"].items()},
-        "bundle": describe(args.bundle, sealed=True, path="macrock-engine-{}.bundle".format(version)),
+        "bundle": describe(args.bundle, sealed=True, cdhash=args.bundle_cdhash,
+                           path="macrock-engine-{}.bundle".format(version)),
         "helper": describe(args.helper, arch="arm64", path="xodus-service-{}/xodus-service".format(version)),
     }
     args.out.write_text(json.dumps(result, indent=2) + "\n")
@@ -144,6 +149,7 @@ def main():
     w.add_argument("--dirty", action="store_true")
     w.add_argument("--component", action="append", required=True)
     w.add_argument("--gptk", required=True)
+    w.add_argument("--service-protocol", type=int, required=True)
     v = commands.add_parser("verify")
     v.add_argument("resources", type=pathlib.Path)
     i = commands.add_parser("index")
@@ -151,6 +157,7 @@ def main():
     i.add_argument("bundle", type=pathlib.Path)
     i.add_argument("helper", type=pathlib.Path)
     i.add_argument("out", type=pathlib.Path)
+    i.add_argument("--bundle-cdhash", required=True)
     args = parser.parse_args()
     {"write": write, "verify": verify, "index": index}[args.command](args)
 

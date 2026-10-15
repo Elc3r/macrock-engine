@@ -47,18 +47,10 @@ Windows without it; the Windows App SDK bootstrapper's `PackageManager` fails ha
   `libhttpclient.gdk`, `xcurl`), PlayFab multiplayer, its UI (`cohtml`, `renoircore`), `v8`,
   `fmod`, its media decoders and the Windows App SDK, self-contained.
 - From the prefix: the runtime's `xgameruntime.dll` (copied by the prefix setup) and Microsoft's
-  GameInput redistributable. GameInput's service is not registered: controllers do not work yet.
+  GameInput redistributable, whose service is not registered
+  ([known issue](known-issues.md#controllers)).
 - The skin picker needs, besides the Windows App SDK classes, `bcp47mrm.dll` (`IsWellFormedTag`,
   and `GetDistanceOfClosestLanguageInList` looked up by name) and a COM fix for the picker's return
   to the game's thread (topics `bcp47mrm`, `com-context`).
 - HTTPS goes through Wine's WinHTTP with Schannel over GnuTLS; the game asks for HTTP/2, which
   WinHTTP ignores, and for one WebSocket option that is not implemented (logged, no effect seen).
-
-## Observed behaviour
-
-- Sign-in, online play, the friend list, presence and parties (PlayFab lobbies over SignalR) work.
-- Skins import from a file. A classic skin imported on another device does not appear: Bedrock
-  does not sync imported skins.
-- Realms: the landing page and the free trial offer load; choosing a plan says "Couldn't access
-  platform store", without a further Store call (see known-issues.md).
-- The Marketplace and the Realms offers show prices from the public catalog.

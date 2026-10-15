@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:06:32 +0200
+Subject: [PATCH] service: serve only the launcher, on a channel it passes as
+ standard input.
+
+The keychain trusts the service's signature, and the service took its keychain namespace from
+the environment: any process of the user could run a signed service and ask it for an account's
+tokens. A signed service now needs XODUS_LAUNCHER_CHANNEL=stdin and a socket as standard input.
+Before it touches the keychain, it checks the socket's peer by its audit token (LOCAL_PEERTOKEN)
+against `identifier "dev.macrock.launcher" and certificate leaf = H"..."`, where the leaf is the
+service's own certificate: only the holder of that certificate's key can sign such a launcher.
+Otherwise it exits with status 78 (EX_CONFIG). A service signed ad hoc, which the keychain trusts
+for nothing a release created, may run without the channel, for development and tests.
+
+The channel carries the service's frames with PROTO_MAGIC and the messages of
+proto/xodus/launcher.proto. LAUNCHER_HELLO is answered with the channel protocol's version.
+Closing the channel stops the service, as a signal does.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: launcher-channel
+---
+ Cargo.lock                              |   5 +
+ crates/xodus-service/Cargo.toml         |   7 +
+ crates/xodus-service/src/launcher.rs    | 190 ++++++++++++++++++++++++
+ crates/xodus-service/src/main.rs        |  21 +++
+ crates/xodus/build.rs                   |   5 +-
+ crates/xodus/proto/xodus/common.proto   |   3 +
+ crates/xodus/proto/xodus/launcher.proto |  10 ++
+ 7 files changed, 240 insertions(+), 1 deletion(-)
+ create mode 100644 crates/xodus-service/src/launcher.rs
+ create mode 100644 crates/xodus/proto/xodus/launcher.proto
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ac47ad552c1c4f42f53a01454bc22ff71bc6ef81..05c00ab774cbdb8059cdea3f264af3df84cf0263 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7206,9 +7206,14 @@ version = "0.1.0"
+ dependencies = [
+  "chrono",
+  "console-subscriber",
++ "core-foundation 0.10.1",
++ "libc",
++ "prost",
+  "quick-xml 0.42.0",
+  "reqwest 0.13.4",
++ "security-framework",
+  "serde_json",
++ "sha1",
+  "tokio",
+  "tokio-util",
+  "tracing",
+diff --git a/crates/xodus-service/Cargo.toml b/crates/xodus-service/Cargo.toml
+index 8546c7842b71312202ace71db26b9e01d73da37a..0813549ad3825f57a8b857f5e13d9c978b03ca97 100644
+--- a/crates/xodus-service/Cargo.toml
++++ b/crates/xodus-service/Cargo.toml
+@@ -15,6 +15,13 @@ console-subscriber = { workspace = true, optional = true }
+ quick-xml = { version = "0.42.0", features = ["serialize", "overlapped-lists"] }
+ tokio-util = "0.7.19"
+ serde_json = "1.0.151"
++libc = "0.2"
++prost = "0.14"
++
++[target.'cfg(target_os = "macos")'.dependencies]
++core-foundation = "0.10"
++security-framework = "3.7"
++sha1 = "0.10"
+ 
+ [features]
+ tokio_console = ["dep:console-subscriber"]
+diff --git a/crates/xodus-service/src/launcher.rs b/crates/xodus-service/src/launcher.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..03dd8c965268026bc298f6d31d8f435d9d1a48a8
+--- /dev/null
++++ b/crates/xodus-service/src/launcher.rs
+@@ -0,0 +1,190 @@
++//! The launcher's channel: a socket the launcher passes as the service's standard input, so that
++//! only the launcher speaks on it. Its frames carry PROTO_MAGIC and the messages of
++//! `launcher.proto`; closing it stops the service.
++
++use std::os::fd::FromRawFd;
++
++use prost::Message;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::UnixStream;
++use xodus::proto::xodus::{Hello, XodusMessageType};
++
++use crate::PROTO_MAGIC;
++
++/// The version of the channel's messages, which HELLO tells the launcher.
++const PROTOCOL: u32 = 1;
++
++/// The identifier the launcher is signed with.
++#[cfg(target_os = "macos")]
++const LAUNCHER_IDENTIFIER: &str = "dev.macrock.launcher";
++
++/// Opens the channel when XODUS_LAUNCHER_CHANNEL is `stdin`. The keychain trusts a signed
++/// service, whoever runs it, so a signed service serves only a launcher signed with its own
++/// certificate, and checks that before it touches the keychain. A service signed ad hoc gets no
++/// trust from the keychain for what a release created, and may run without the channel.
++pub fn open() -> Result<Option<UnixStream>, String> {
++    let requested = std::env::var("XODUS_LAUNCHER_CHANNEL").is_ok_and(|value| value == "stdin");
++    let certificate = own_certificate()?;
++    if !requested {
++        return match certificate {
++            Some(_) => Err("a signed service needs the launcher channel".to_string()),
++            None => Ok(None),
++        };
++    }
++    match certificate {
++        Some(certificate) => check_peer(&certificate)?,
++        None => tracing::warn!("Signed ad hoc: the launcher channel's peer is not checked"),
++    }
++    // SAFETY: standard input is not used anywhere else; the stream takes it over.
++    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
++    stream
++        .set_nonblocking(true)
++        .and_then(|()| UnixStream::from_std(stream))
++        .map(Some)
++        .map_err(|err| format!("the launcher channel: {err}"))
++}
++
++/// Answers the launcher's messages until it closes the channel.
++pub async fn serve(mut channel: UnixStream) {
++    loop {
++        let mut header = [0; 8];
++        if let Err(err) = channel.read_exact(&mut header).await {
++            if err.kind() != std::io::ErrorKind::UnexpectedEof {
++                tracing::error!("Failed to read from the launcher channel: {err}");
++            }
++            return;
++        }
++        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
++        let message_type = u16::from_le_bytes([header[4], header[5]]);
++        let size = u16::from_le_bytes([header[6], header[7]]);
++        if magic != PROTO_MAGIC {
++            tracing::error!("Unknown magic on the launcher channel");
++            return;
++        }
++        let mut payload = vec![0; usize::from(size)];
++        if let Err(err) = channel.read_exact(&mut payload).await {
++            tracing::error!("Failed to read from the launcher channel: {err}");
++            return;
++        }
++        let reply = match XodusMessageType::try_from(i32::from(message_type)) {
++            Ok(XodusMessageType::LauncherHello) => Hello { protocol: PROTOCOL }.encode_to_vec(),
++            _ => Vec::new(),
++        };
++        let frame = crate::connection::encode_message(PROTO_MAGIC, message_type + 1, reply);
++        if let Err(err) = channel.write_all(&frame).await {
++            tracing::error!("Failed to answer on the launcher channel: {err}");
++            return;
++        }
++    }
++}
++
++/// The DER of the certificate the service is signed with, or None when it is signed ad hoc.
++#[cfg(target_os = "macos")]
++fn own_certificate() -> Result<Option<Vec<u8>>, String> {
++    use core_foundation::array::CFArray;
++    use core_foundation::base::{CFType, TCFType};
++    use core_foundation::dictionary::CFDictionary;
++    use core_foundation::string::{CFString, CFStringRef};
++    use security_framework::certificate::SecCertificate;
++    use security_framework::os::macos::code_signing::{Flags, SecCode};
++
++    #[link(name = "Security", kind = "framework")]
++    unsafe extern "C" {
++        fn SecCodeCopySigningInformation(
++            code: *const std::ffi::c_void,
++            flags: u32,
++            information: *mut core_foundation::dictionary::CFDictionaryRef,
++        ) -> i32;
++        static kSecCodeInfoCertificates: CFStringRef;
++    }
++    // kSecCSSigningInformation: include the certificate chain.
++    const SIGNING_INFORMATION: u32 = 1 << 1;
++
++    let code = SecCode::for_self(Flags::NONE).map_err(|err| format!("code signing: {err}"))?;
++    let mut information = std::ptr::null();
++    // SAFETY: the call writes a dictionary the caller owns, under the create rule.
++    let status = unsafe {
++        SecCodeCopySigningInformation(
++            code.as_concrete_TypeRef().cast(),
++            SIGNING_INFORMATION,
++            &mut information,
++        )
++    };
++    if status != 0 || information.is_null() {
++        return Err(format!("code signing: OSStatus {status}"));
++    }
++    // SAFETY: a dictionary returned under the create rule; the key is a constant of Security.
++    let (information, key) = unsafe {
++        (
++            CFDictionary::<CFString, CFType>::wrap_under_create_rule(information),
++            CFString::wrap_under_get_rule(kSecCodeInfoCertificates),
++        )
++    };
++    let Some(certificates) = information
++        .find(&key)
++        .and_then(|value| value.downcast::<CFArray>())
++    else {
++        return Ok(None);
++    };
++    // SAFETY: kSecCodeInfoCertificates is an array of certificates, the leaf first.
++    let leaf = certificates.get(0).map(|leaf| unsafe {
++        SecCertificate::wrap_under_get_rule((*leaf).cast_mut().cast()).to_der()
++    });
++    Ok(leaf)
++}
++
++#[cfg(not(target_os = "macos"))]
++fn own_certificate() -> Result<Option<Vec<u8>>, String> {
++    Ok(None)
++}
++
++/// Checks that the process at the other end of standard input is the launcher, signed with
++/// `certificate`: only the holder of that certificate's key can sign such a launcher.
++#[cfg(target_os = "macos")]
++fn check_peer(certificate: &[u8]) -> Result<(), String> {
++    use core_foundation::base::TCFType;
++    use core_foundation::data::CFData;
++    use security_framework::os::macos::code_signing::{
++        Flags, GuestAttributes, SecCode, SecRequirement,
++    };
++    use sha1::{Digest, Sha1};
++
++    let mut token = [0u8; 32];
++    let mut length = token.len() as libc::socklen_t;
++    // SAFETY: getsockopt writes at most `length` bytes into `token`.
++    let result = unsafe {
++        libc::getsockopt(
++            0,
++            libc::SOL_LOCAL,
++            libc::LOCAL_PEERTOKEN,
++            token.as_mut_ptr().cast(),
++            &mut length,
++        )
++    };
++    if result != 0 || length as usize != token.len() {
++        return Err(format!(
++            "the launcher channel has no peer: {}",
++            std::io::Error::last_os_error()
++        ));
++    }
++    let token = CFData::from_buffer(&token);
++    let mut attributes = GuestAttributes::new();
++    attributes.set_audit_token(token.as_concrete_TypeRef());
++    let peer = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)
++        .map_err(|err| format!("the launcher channel's peer: {err}"))?;
++    let leaf: String = Sha1::digest(certificate)
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect();
++    let requirement: SecRequirement =
++        format!(r#"identifier "{LAUNCHER_IDENTIFIER}" and certificate leaf = H"{leaf}""#)
++            .parse()
++            .map_err(|err| format!("the launcher's requirement: {err}"))?;
++    peer.check_validity(Flags::NONE, &requirement)
++        .map_err(|_| "the launcher channel's peer is not the launcher".to_string())
++}
++
++#[cfg(not(target_os = "macos"))]
++fn check_peer(_certificate: &[u8]) -> Result<(), String> {
++    Ok(())
++}
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index abd136ca2af9df4b6762d4619bc8a09b2a0dc005..d8ee410d03f8d394502e3a8d8a81edc88d41c99f 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -14,6 +14,7 @@ use xodus::tokens::TokenManager;
+ use xodus::tokens::device::DeviceError;
+ 
+ mod connection;
++mod launcher;
+ mod simple_context;
+ mod utils;
+ 
+@@ -28,6 +29,8 @@ mod status {
+     pub const CANT_CREATE: u8 = 73;
+     /// The keychain refused access to the credentials.
+     pub const NO_PERMISSION: u8 = 77;
++    /// The launcher channel is missing, or its peer is not the launcher.
++    pub const CONFIG: u8 = 78;
+ }
+ 
+ fn main() -> ExitCode {
+@@ -69,6 +72,22 @@ async fn run() -> ExitCode {
+     // Installed before anything that can take long, so that SIGINT or SIGTERM stops the service
+     // cleanly at any time.
+     let mut stop = StopSignals::install().expect("Unable to handle SIGINT and SIGTERM");
++    let channel = match launcher::open() {
++        Ok(channel) => channel,
++        Err(message) => {
++            tracing::error!("{message}");
++            return ExitCode::from(status::CONFIG);
++        }
++    };
++    // The launcher closing its channel stops the service as a signal does.
++    let closed = CancellationToken::new();
++    if let Some(channel) = channel {
++        let closed = closed.clone();
++        tokio::spawn(async move {
++            launcher::serve(channel).await;
++            closed.cancel();
++        });
++    }
+     // Reading the keychain blocks the thread while macOS asks the user, so the start runs as a
+     // task of its own.
+     let started = tokio::select! {
+@@ -77,6 +96,7 @@ async fn run() -> ExitCode {
+             Err(err) => std::panic::resume_unwind(err.into_panic()),
+         },
+         () = stop.received() => return ExitCode::SUCCESS,
++        () = closed.cancelled() => return ExitCode::SUCCESS,
+     };
+     let tokens = match started {
+         Ok(started) => started,
+@@ -119,6 +139,7 @@ async fn run() -> ExitCode {
+                 Err(err) => tracing::warn!("Failed to accept a connection: {err}"),
+             },
+             () = stop.received() => break,
++            () = closed.cancelled() => break,
+         }
+     }
+     cancellation.cancel();
+diff --git a/crates/xodus/build.rs b/crates/xodus/build.rs
+index 7a698eac66f6d90ebe38b40536cbe924337e8741..bae917cb3d9d804f8c67c0e1356626e1fa38da0d 100644
+--- a/crates/xodus/build.rs
++++ b/crates/xodus/build.rs
+@@ -1,5 +1,8 @@
+ use std::io::Result;
+ fn main() -> Result<()> {
+-    prost_build::compile_protos(&["./proto/xodus/common.proto"], &["./proto"])?;
++    prost_build::compile_protos(
++        &["./proto/xodus/common.proto", "./proto/xodus/launcher.proto"],
++        &["./proto"],
++    )?;
+     Ok(())
+ }
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index f1fd68a5fc65a797599bb121434e370316096c5a..6197db4ebb0fc6be8696acdc134f7b6fa3bf72c1 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -11,4 +11,7 @@ enum XodusMessageType {
+     // macrock's messages, numbered apart from upstream's.
+     GAME_LICENSE_REQUEST=100;
+     GAME_LICENSE_RESPONSE=101;
++    // The launcher channel's messages.
++    LAUNCHER_HELLO=200;
++    LAUNCHER_HELLO_RESPONSE=201;
+ }
+diff --git a/crates/xodus/proto/xodus/launcher.proto b/crates/xodus/proto/xodus/launcher.proto
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e95149bb18b0e48e5c7ba28cf82a3382f39401b
+--- /dev/null
++++ b/crates/xodus/proto/xodus/launcher.proto
+@@ -0,0 +1,10 @@
++syntax = "proto3";
++
++// The launcher channel's messages (macrock). The launcher passes the channel as the service's
++// standard input; its frames carry PROTO_MAGIC, a XodusMessageType and one of these messages.
++package xodus;
++
++// LAUNCHER_HELLO, and its response: the version of the channel's protocol.
++message Hello {
++    uint32 protocol = 1;
++}

@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 18:44:07 +0200
+Subject: [PATCH] service: stop on SIGTERM as on SIGINT, and exit with a status
+ instead of panicking.
+
+The service handled only SIGINT, and only once it listened: SIGTERM, or SIGINT during the device's
+registration, killed it without removing its socket. It also panicked when the keychain refused,
+when Microsoft could not be reached and when the socket was taken. Both signals now stop it
+cleanly at any time, even while a keychain prompt waits for the user. Failures exit with a status
+a launcher can explain (sysexits.h): 69 when Microsoft did not register or authenticate the
+device, 73 when the socket cannot be created, 77 when the keychain refused. A failed accept() is
+logged instead of panicking.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: service-lifecycle
+---
+ crates/xodus-service/src/main.rs | 143 +++++++++++++++++++++++--------
+ 1 file changed, 109 insertions(+), 34 deletions(-)
+
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index b42d2b09d60b222efe194aadfa35f1373b09a245..6a6b1fb244110b4c4c8a5b5e10b0225f72ded904 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -1,14 +1,18 @@
+ use std::fs::Permissions;
+ use std::io::IsTerminal;
+ use std::os::unix::fs::PermissionsExt;
++use std::process::ExitCode;
+ use std::sync::Arc;
+ 
+ use tokio::net::UnixListener;
++use tokio::signal::unix::{Signal, SignalKind, signal};
+ use tokio_util::sync::CancellationToken;
+ use tracing_subscriber::Layer;
+ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
++use xodus::models::secrets::LegacyToken;
+ use xodus::tokens::TokenManager;
++use xodus::tokens::device::DeviceError;
+ 
+ mod connection;
+ mod simple_context;
+@@ -17,8 +21,26 @@ mod utils;
+ const XML_MAGIC: u32 = 0x58445358;
+ const PROTO_MAGIC: u32 = 0x58445350;
+ 
+-#[tokio::main]
+-async fn main() {
++/// Exit statuses besides 0 (sysexits.h), for a launcher to explain.
++mod status {
++    /// Microsoft could not be reached, or did not register or authenticate the device.
++    pub const UNAVAILABLE: u8 = 69;
++    /// The socket could not be created.
++    pub const CANT_CREATE: u8 = 73;
++    /// The keychain refused access to the credentials.
++    pub const NO_PERMISSION: u8 = 77;
++}
++
++fn main() -> ExitCode {
++    let runtime = tokio::runtime::Runtime::new().expect("Unable to start the runtime");
++    let status = runtime.block_on(run());
++    // A thread can still be waiting for the user to answer a keychain prompt: the service exits
++    // without waiting for it.
++    runtime.shutdown_background();
++    status
++}
++
++async fn run() -> ExitCode {
+     // Standard error keeps standard output free for a protocol; colours only for a terminal,
+     // since a launcher stores the log.
+     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
+@@ -45,14 +67,26 @@ async fn main() {
+         registry.init();
+     }
+ 
+-    xodus::secrets::init_secrets().expect("Failed to init keychain");
+-    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
+-    let device_token =
+-        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens)
+-            .await
+-            .expect("Failed to get the device's credentials");
++    // Installed before anything that can take long, so that SIGINT or SIGTERM stops the service
++    // cleanly at any time.
++    let mut stop = StopSignals::install().expect("Unable to handle SIGINT and SIGTERM");
++    // Reading the keychain blocks the thread while macOS asks the user, so the start runs as a
++    // task of its own.
++    let started = tokio::select! {
++        started = tokio::spawn(start()) => match started {
++            Ok(started) => started,
++            Err(err) => std::panic::resume_unwind(err.into_panic()),
++        },
++        () = stop.received() => return ExitCode::SUCCESS,
++    };
++    let (tokens, device_token) = match started {
++        Ok(started) => started,
++        Err((status, message)) => {
++            tracing::error!("{message}");
++            return ExitCode::from(status);
++        }
++    };
+ 
+-    let cancellation = CancellationToken::new();
+     let socket_path = std::env::var("XODUS_SOCKET")
+         .ok()
+         .filter(|path| !path.is_empty())
+@@ -63,33 +97,74 @@ async fn main() {
+     {
+         _ = std::fs::remove_file(&socket_path);
+     }
+-    let trigger = cancellation.clone();
+-    tokio::spawn(async move {
+-        tokio::signal::ctrl_c()
+-            .await
+-            .expect("Failure to handle ctrl_c");
+-        trigger.cancel();
+-    });
+-    {
+-        let listener = UnixListener::bind(&socket_path).expect("Unable to bind to socket");
+-        let mode = 0o600;
+-        let perms = Permissions::from_mode(mode);
+-        _ = tokio::fs::set_permissions(&socket_path, perms).await;
+-        loop {
+-            let accept = tokio::select! {
+-                r = listener.accept() => r,
+-                _ = cancellation.cancelled() => break,
+-            }
+-            .expect("Failed to accept");
++    let listener = match UnixListener::bind(&socket_path) {
++        Ok(listener) => listener,
++        Err(err) => {
++            tracing::error!("Unable to bind to the socket: {err}");
++            return ExitCode::from(status::CANT_CREATE);
++        }
++    };
++    _ = tokio::fs::set_permissions(&socket_path, Permissions::from_mode(0o600)).await;
+ 
+-            let token = cancellation.clone();
+-            let device_token = device_token.clone();
+-            let tokens = tokens.clone();
+-            tokio::spawn(async move {
+-                connection::router::route(accept.0, token, device_token, tokens).await
+-            });
++    let cancellation = CancellationToken::new();
++    loop {
++        tokio::select! {
++            accepted = listener.accept() => match accepted {
++                Ok((socket, _)) => {
++                    let token = cancellation.clone();
++                    let device_token = device_token.clone();
++                    let tokens = tokens.clone();
++                    tokio::spawn(async move {
++                        connection::router::route(socket, token, device_token, tokens).await
++                    });
++                }
++                Err(err) => tracing::warn!("Failed to accept a connection: {err}"),
++            },
++            () = stop.received() => break,
+         }
+     }
+-
++    cancellation.cancel();
+     _ = tokio::fs::remove_file(socket_path).await;
++    ExitCode::SUCCESS
++}
++
++/// Opens the keychain and makes sure the device has credentials, registering it with Microsoft
++/// the first time. A failure comes with the exit status that names it.
++async fn start() -> Result<(Arc<TokenManager>, LegacyToken), (u8, String)> {
++    xodus::secrets::init_secrets()
++        .map_err(|err| (status::NO_PERMISSION, format!("keychain: {err}")))?;
++    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
++    let device_token =
++        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens)
++            .await
++            .map_err(|err| {
++                let status = match err {
++                    DeviceError::Keychain(_) => status::NO_PERMISSION,
++                    DeviceError::Microsoft(_) => status::UNAVAILABLE,
++                };
++                (status, err.to_string())
++            })?;
++    Ok((tokens, device_token))
++}
++
++/// SIGINT and SIGTERM, whichever comes first. Their handlers are installed on creation.
++struct StopSignals {
++    interrupt: Signal,
++    terminate: Signal,
++}
++
++impl StopSignals {
++    fn install() -> std::io::Result<Self> {
++        Ok(Self {
++            interrupt: signal(SignalKind::interrupt())?,
++            terminate: signal(SignalKind::terminate())?,
++        })
++    }
++
++    async fn received(&mut self) {
++        tokio::select! {
++            _ = self.interrupt.recv() => {}
++            _ = self.terminate.recv() => {}
++        }
++    }
+ }
