@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:57:13 +0200
+Subject: [PATCH] service: log why the licensing service refuses a game
+ license.
+
+A license the licensing service cannot satisfy comes with a code and a description. The code was
+dropped, and the description went to the xodus crate's log, which the service's filter leaves
+out. GameLicense now carries both as its refusal, and the service logs it next to the license,
+with the service's own target.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: game-license
+---
+ crates/xodus-service/src/connection/xml.rs |  7 ++++
+ crates/xodus/src/licensing/content.rs      | 41 +++++++++++++++++-----
+ crates/xodus/src/licensing/game.rs         | 12 ++++---
+ crates/xodus/src/licensing/key.rs          |  2 +-
+ 4 files changed, 48 insertions(+), 14 deletions(-)
+
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 570a9da14ebbec4f8523789177bb39ce3241f508..e6af6d283969a0b46a934d93f0886c01e4619f7f 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -158,6 +158,13 @@ pub async fn parse_message(
+                         license.is_active,
+                         license.is_trial
+                     );
++                    if let Some(refusal) = &license.refusal {
++                        tracing::info!(
++                            "The licensing service refused {}: {}",
++                            req.store_id,
++                            refusal
++                        );
++                    }
+                     GameLicenseResponse {
+                         is_active: license.is_active,
+                         is_trial: license.is_trial,
+diff --git a/crates/xodus/src/licensing/content.rs b/crates/xodus/src/licensing/content.rs
+index d929127f29f02819e5262157718e4315d344b11c..6ad979711aa9fc0bf77f3cca86d72b83a78fc152 100644
+--- a/crates/xodus/src/licensing/content.rs
++++ b/crates/xodus/src/licensing/content.rs
+@@ -8,7 +8,7 @@ use crate::licensing::utils;
+ use crate::models::devicecredential::License;
+ use crate::models::licensing::{
+     DeviceContext, LicenseContent, LicenseContentRequest, LicenseContentResponse,
+-    LicenseTokenRequest, LicenseTokenResponse, LicenseUserIdentity,
++    LicenseTokenRequest, LicenseTokenResponse, LicenseUserIdentity, SatisfactionFailure,
+ };
+ 
+ #[derive(Debug, thiserror::Error)]
+@@ -18,14 +18,23 @@ pub enum LicenseContentError {
+ 
+     /// The account has no entitlement for the requested content (not owned, or
+     /// not covered by the account's current subscription tier).
+-    #[error("not entitled to this content: {description}")]
+-    NotEntitled { description: String },
++    #[error("not entitled to this content: code {code}: {description}")]
++    NotEntitled { code: i64, description: String },
+ 
+     /// The answer does not hold a license the client can read.
+     #[error("unreadable license: {0}")]
+     Unreadable(String),
+ }
+ 
++impl From<SatisfactionFailure> for LicenseContentError {
++    fn from(failure: SatisfactionFailure) -> Self {
++        LicenseContentError::NotEntitled {
++            code: failure.code,
++            description: failure.description,
++        }
++    }
++}
++
+ // we might need a bump in xal-rs concerning reqwest,
+ // that might block us from using the correlationvector extension
+ pub async fn get_license_content(
+@@ -69,11 +78,7 @@ pub async fn get_license_content(
+         LicenseContentResponse::Success { license } => license,
+         LicenseContentResponse::SatisfactionFailure {
+             satisfaction_failure,
+-        } => {
+-            return Err(LicenseContentError::NotEntitled {
+-                description: satisfaction_failure.description,
+-            });
+-        }
++        } => return Err(satisfaction_failure.into()),
+     };
+     let unreadable = |err: &dyn std::fmt::Display| LicenseContentError::Unreadable(err.to_string());
+     let license = &content.keys.first().ok_or_else(|| unreadable(&"no key"))?.value;
+@@ -118,3 +123,23 @@ pub async fn get_license_token(
+ 
+     Ok(token_resp.license_token)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_refusal_keeps_the_code_and_the_description_the_licensing_service_gives() {
++        let response = serde_json::from_str::<LicenseContentResponse>(
++            r#"{"satisfactionFailure":{"code":2,"description":"No license"}}"#,
++        )
++        .unwrap();
++        let LicenseContentResponse::SatisfactionFailure { satisfaction_failure } = response else {
++            panic!("a refusal was read as a license");
++        };
++        assert_eq!(
++            LicenseContentError::from(satisfaction_failure).to_string(),
++            "not entitled to this content: code 2: No license"
++        );
++    }
++}
+diff --git a/crates/xodus/src/licensing/game.rs b/crates/xodus/src/licensing/game.rs
+index f5e4ad0491a12f733e4a0326f9a26ce6380f2c4a..4577a47df990ca85adcda8c4efce6d53596a6e9d 100644
+--- a/crates/xodus/src/licensing/game.rs
++++ b/crates/xodus/src/licensing/game.rs
+@@ -19,6 +19,8 @@ pub struct GameLicense {
+     pub is_active: bool,
+     pub is_trial: bool,
+     pub sku_store_id: String,
++    /// Why the licensing service refused the license, with the code it gave.
++    pub refusal: Option<String>,
+ }
+ 
+ #[derive(Debug, thiserror::Error)]
+@@ -72,12 +74,12 @@ pub async fn query_game_license(
+         Ok((_content, license)) => {
+             let is_trial = license.license_info.license_category.as_deref() == Some("Trial");
+             let sku_store_id = if is_trial { trial_sku } else { full_sku }.unwrap_or_default();
+-            Ok(GameLicense { is_active: true, is_trial, sku_store_id })
+-        }
+-        Err(LicenseContentError::NotEntitled { description }) => {
+-            tracing::info!("No license for {store_id}: {description}");
+-            Ok(GameLicense::default())
++            Ok(GameLicense { is_active: true, is_trial, sku_store_id, refusal: None })
+         }
++        Err(LicenseContentError::NotEntitled { code, description }) => Ok(GameLicense {
++            refusal: Some(format!("code {code}: {description}")),
++            ..GameLicense::default()
++        }),
+         Err(LicenseContentError::Request(error)) => Err(error.into()),
+         Err(LicenseContentError::Unreadable(reason)) => Err(GameLicenseError::Catalog(reason)),
+     }
+diff --git a/crates/xodus/src/licensing/key.rs b/crates/xodus/src/licensing/key.rs
+index 0ec01fac2ac0edb556b13782dc95323ee7135926..42ee8d83844457c652ab7795f9803fb259fb60a7 100644
+--- a/crates/xodus/src/licensing/key.rs
++++ b/crates/xodus/src/licensing/key.rs
+@@ -37,7 +37,7 @@ pub async fn content_key(
+         get_license_content(client, device_token, user_token, puid, content_id, market)
+             .await
+             .map_err(|err| match err {
+-                LicenseContentError::NotEntitled { description } => {
++                LicenseContentError::NotEntitled { description, .. } => {
+                     ContentKeyError::NotEntitled(description)
+                 }
+                 LicenseContentError::Request(err) => ContentKeyError::Request(err),
